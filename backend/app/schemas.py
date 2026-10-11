@@ -240,16 +240,18 @@ def _payload_fhashes(fps: list[FilePayload]) -> list:
 
 
 def _token_whitelisted(tok: str, typ: str | None, index: list[TokenRef]) -> bool:
-    """前缀感知白名单(裁定 R24):tok 与 t.token 全等或互为前缀即同一令牌引用。
+    """前缀感知白名单(裁定 R24):引用是索引令牌的前缀或全等才算同一令牌。
 
     显示形态须 TYPE 匹配;TYPE 匹配时任意长度前缀(含 5 字符前缀)是对
     同一令牌的合法引用(显示形态本身就是 10 字符前缀)。裸形态无 TYPE,
-    任意 TokenRef 命中前缀/全等关系即通过。
+    任意 TokenRef 命中前缀/全等关系即通过。方向严格单向:只认
+    t.token.startswith(tok)(引用=展示前缀),不认反向 tok.startswith(t.token)
+    —— 后缀扩展([TYPE#真令牌+附加字符])是伪造引用,不得过闸。
     """
     for t in index:
         if typ is not None and t.type != typ:
             continue
-        if tok == t.token or t.token.startswith(tok) or tok.startswith(t.token):
+        if tok == t.token or t.token.startswith(tok):
             return True
     return False
 
@@ -300,7 +302,8 @@ def verify_outbound(req: OutboundRequest, k_t1: bytes, session_salt: bytes,
     1. 正文/文件中出现的所有令牌 ⊆ token_index(前缀感知,裁定 R24:
        显示形态 [TYPE#tok] 与裸 26 位 base32 均视为令牌引用,
        全角括号 ［］归一化为 ASCII 后扫描;TYPE 匹配时任意前缀即合法引用);
-    2. T1 令牌 HMAC 重算与声明一致(仅当提供 token_values:token -> (type, value));
+    2. T1 令牌 HMAC 重算与声明一致(仅当提供 token_values:token -> (type, value);
+       缺本地映射即违规,fail-closed;T2 FF1 复算未实现 —— 已知偏差);
     3. input_hash 从请求字段重算一致;readable 文件哈希恒按内容重算,
        声明 file_content_hash 与内容不一致即违规(裁定 R24)。
     """
@@ -326,13 +329,16 @@ def verify_outbound(req: OutboundRequest, k_t1: bytes, session_salt: bytes,
                 seen.add(tok)
                 violations.append(f"令牌 {tok} 不在 token_index")
 
-    # 规则 2:T1 HMAC 重算(仅在提供 token_values 时,且仅对 T1 令牌)
+    # 规则 2:T1 HMAC 重算(仅在提供 token_values 时,且仅对 T1 令牌;
+    # T2 FF1 复算未实现 —— 已知偏差,见 docs/ACCEPTANCE.md)。
+    # fail-closed:token_values 已提供但令牌缺本地映射 → 违规,不得静默跳过。
     if token_values is not None:
         for t in req.token_index:
             if t.tier != "T1":
                 continue
             entry = token_values.get(t.token)
             if entry is None:
+                violations.append(f"令牌 {t.token} 缺少本地映射,无法复核")
                 continue
             typ, value = entry
             if t1_pseudonym(k_t1, typ, value, session_salt) != t.token:

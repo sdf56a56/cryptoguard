@@ -3,7 +3,8 @@ PERF-TRUTH-1 计时条真值(spec §6.3)—— 双断言 + mock_sleep_ms 一致�
 
 断言一:后端 pipeline 每段 duration_ms 的 2 位小数字符串 == f"{v:.2f}"
         (后端计时值 -> WS 帧 -> DOM 同源格式化,三处字符串逐字节相等的后端源)
-断言二:后端原始值与帧值差 < 0.01ms(sent = round(raw, 2) 量化,|raw-sent| <= 0.005)
+断言二:raw 携带 + 差值界 —— raw−sent < 0.01ms 且 sent = round(raw, 2)
+        (duration_raw_ms 未舍入原值随步携带,duration_ms 为其 2 位小数量化)
 断言三:mock_sleep_ms 字段必须存在且与帧内 LLM 段一致(50-100ms)。
 """
 from app.proxy import CryptoGuard
@@ -35,13 +36,14 @@ def test_perf_truth_1_duration_two_decimal_string():
 
 
 def test_perf_truth_1_raw_vs_sent_within_001ms():
-    """断言二:后端原始值与帧值差 < 0.01ms(量化误差界 <= 0.005ms)。"""
+    """断言二:raw 携带 + 差值界 —— raw−sent < 0.01ms 且 sent = round(raw, 2)。"""
     r = _run()
     for step in r["pipeline"]:
-        v = step["duration_ms"]
-        sent = float(f"{v:.2f}")          # WS 帧/DOM 收到的 2 位小数值
-        assert abs(v - sent) < 0.01, step
-        assert v == round(v, 2)           # sent = round(raw, 2) 的落盘形态
+        raw = step["duration_raw_ms"]     # 后端未舍入原值(随步携带)
+        sent = step["duration_ms"]        # WS 帧/DOM 收到的 2 位小数值
+        assert isinstance(raw, (int, float)) and raw >= 0, step
+        assert abs(raw - sent) < 0.01, step
+        assert sent == round(raw, 2), step  # 重序列化错口径即可打穿
 
 
 def test_perf_truth_1_mock_sleep_ms_consistent():

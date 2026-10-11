@@ -92,6 +92,22 @@ def test_prefix_reference_ruling_r24():
     bad = _outbound_t1(redacted_text=f"患者 [NAME#{ROGUE26[:5]}] 就诊")
     assert any("不在 token_index" in v for v in _viol(bad))
 
+def test_suffix_extension_of_valid_token_rejected():
+    # 裁定 R24 单向:引用只认索引令牌的前缀/全等;后缀扩展
+    # ([NAME#真令牌+附加字符])是伪造引用,不得过闸
+    req = _outbound_t1(redacted_text=f"患者 [NAME#{TOK26}XYZ] 就诊")
+    assert any("不在 token_index" in v for v in _viol(req))
+
+# =====================================================================
+# Final fix wave —— 网关规则 2 fail-closed
+# =====================================================================
+
+def test_rule2_missing_token_values_entry_fails_closed():
+    # token_values 已提供但令牌缺本地映射 → 违规(不得静默跳过,无法复核即拒)
+    req = _outbound_t1()
+    v = verify_outbound(req, b"k" * 32, b"s" * 16, token_values={})
+    assert any("缺少本地映射" in x for x in v)
+
 # =====================================================================
 # Fix round 1(裁定 R24)—— 网关规则 3:readable 文件哈希恒按内容重算
 # =====================================================================

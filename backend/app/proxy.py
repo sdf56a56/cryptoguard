@@ -3,12 +3,15 @@
 
 数据流：明文 → 脱敏 → (CP-ABE/SSE/ZKP 增强) → 出站 → Mock LLM → 回程四层验证 → 还原
 
-四层协议：
-  1 输入绑定   input_hash = H(脱敏输入) + nonce + timestamp
-  2 模型身份   model_cert = Sign(sk_auditor, model_id||version||release_date||model_hash)
-  3 响应完整   response_hash = H(output||input_hash||model_cert||nonce||timestamp)
+四层协议(JCS 域标签哈希,前映像见 app/tokenchain.py / app/crypto/hashchain.py):
+  1 输入绑定   input_hash = H_hex({"d":"CG/INPUT/v2","t":H_hex({"d":"CG/TEXT/v2",...}),
+              "f":[...],"r":token_root,"o":override_h,"n":nonce,"ts":timestamp})
+              时间窗:|now−ts| ≤ 300s(见 within_freshness_window)
+  2 模型身份   model_cert = Sign(sk_auditor, JCS({model_id,version,release_date,model_hash,auditor}))
+  3 响应完整   response_hash = H_hex({"d":"CG/RESP/v2","out":output,"ih":input_hash,
+              "cert":model_cert,"n":nonce,"ts":timestamp})
               signature = Sign(sk_provider, response_hash)
-  4 可审计日志 log_entry_i = H(req_digest||resp_digest||ts||log_entry_{i-1}) + Merkle 根
+  4 可审计日志 log_entry_i = H_hex({"d":"CG/LOG/v2",...}) 链式(prev 进前映像)+ Merkle 根
 """
 from __future__ import annotations
 
@@ -36,6 +39,25 @@ from .mock_llm import MockLLM
 from .schemas import (build_outbound, verify_outbound,
                       OverrideEvent, FilePayload)
 from .tokenchain import file_content_hash
+
+_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+def within_freshness_window(timestamp: str, now: datetime | None = None,
+                            window_s: int = 300) -> bool:
+    """层 1 时间窗(spec §3.3):|now_utc − ts| ≤ window_s(默认 300s)。
+
+    timestamp 为 ISO8601 `%Y-%m-%dT%H:%M:%S.%fZ`(UTC);解析失败或超窗
+    均返回 False(fail-closed)。now 缺省取当前 UTC,可注入假时钟做边界单测。
+    """
+    try:
+        ts = datetime.strptime(timestamp, _TS_FMT).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    ref = now if now is not None else datetime.now(timezone.utc)
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=timezone.utc)
+    return abs((ref - ts).total_seconds()) <= window_s
 
 
 class CryptoGuard:
@@ -94,8 +116,9 @@ class CryptoGuard:
         pipeline: list[dict] = []
 
         def step(name: str, start: float, **meta):
-            dur_ms = round((time.perf_counter() - start) * 1000, 2)
-            pipeline.append({"step": name, "duration_ms": dur_ms, **meta})
+            raw_ms = (time.perf_counter() - start) * 1000
+            pipeline.append({"step": name, "duration_raw_ms": raw_ms,
+                             "duration_ms": round(raw_ms, 2), **meta})
 
         # 1. 敏感检测（按策略：启用的实体类型 + 脱敏模式）
         s = time.perf_counter()
@@ -220,8 +243,9 @@ class CryptoGuard:
         pipeline: list[dict] = []
 
         def step(name: str, start: float, **meta):
-            dur_ms = round((time.perf_counter() - start) * 1000, 2)
-            pipeline.append({"step": name, "duration_ms": dur_ms, **meta})
+            raw_ms = (time.perf_counter() - start) * 1000
+            pipeline.append({"step": name, "duration_raw_ms": raw_ms,
+                             "duration_ms": round(raw_ms, 2), **meta})
 
         session_id = uuid.uuid4().hex
         tok = Tokenizers.default()          # 会话级密钥(k_t1/salt/T2)
@@ -391,12 +415,17 @@ class CryptoGuard:
     def _verify_v2(self, resp: dict, req) -> list[dict]:
         """回程四层验证(CG/2.0 口径:input_hash 为出站包绑定哈希)。"""
         v = []
-        bound = resp["nonce"] == req.nonce and resp["timestamp"] == req.timestamp
-        v.append({
-            "layer": "输入绑定/防重放", "ok": bound,
-            "detail": "nonce/timestamp 与出站包一致" if bound
-                      else "nonce 或 timestamp 不匹配(疑似重放/输入被替换)",
-        })
+        # 层 1:nonce/timestamp 回显一致 AND 5 分钟时间窗(spec §3.3,两者都过才放行)
+        echo_ok = resp["nonce"] == req.nonce and resp["timestamp"] == req.timestamp
+        fresh = within_freshness_window(req.timestamp)
+        bound = echo_ok and fresh
+        if bound:
+            detail = "nonce/timestamp 与出站包一致,且落在 5 分钟时间窗内"
+        elif not fresh:
+            detail = "timestamp 超出 5 分钟时间窗(过期即拒)"
+        else:
+            detail = "nonce 或 timestamp 不匹配(疑似重放/输入被替换)"
+        v.append({"layer": "输入绑定/防重放", "ok": bound, "detail": detail})
         cert_valid = self.auditor.verify_model_cert(resp["model_cert"])
         v.append({
             "layer": "模型身份", "ok": cert_valid,
