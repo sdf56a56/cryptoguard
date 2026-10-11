@@ -69,3 +69,10 @@ body {
   50%, 100% { opacity: 0; }
 }
 .caret { animation: caret-blink 1s step-end infinite; }
+
+/* token_root 链环滚动(动效白名单:绑定证明可视化,数字来自后端,仅位移动画) */
+@keyframes chain-scroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.chain-scroll { animation: chain-scroll 18s linear infinite; }
