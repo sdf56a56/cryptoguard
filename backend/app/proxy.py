@@ -458,6 +458,7 @@ class CryptoGuard:
                       timestamp: str) -> dict:
         entry = self.chain.append(entry_type, payload_digest, timestamp)
         self.merkle_leaves.append(entry["hash"])
+        self.chain.maybe_pack(time.monotonic())   # 打包触发接线(Task 12)
         return entry
 
     # ------------------------------------------------------------------ #

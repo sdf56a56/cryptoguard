@@ -19,12 +19,15 @@ import hashlib
 import time
 
 from ..canon import h_hex
+from .merkle import MerkleTree
 
 # entry_type 枚举(裁定 R21):QUERY=查询 / FILE_COMMIT=文件承诺 /
 # USER_OVERRIDE=用户决策 / COMPUTE_GATE=计算网关指令(含拒绝)
 ENTRY_TYPES = frozenset({"QUERY", "FILE_COMMIT", "USER_OVERRIDE", "COMPUTE_GATE"})
 
 D_LOG = "CG/LOG/v2"
+
+PACK_INTERVAL = 300.0   # 时间触发:距上次打包 ≥ 5 分钟
 
 
 def sha256_hex(*parts: str) -> str:
@@ -47,6 +50,9 @@ class HashChain:
     def __init__(self):
         self.entries: list[dict] = []
         self._prev = "0" * 64  # 创世块前驱 = 全零
+        self.packs: list[dict] = []   # 每包 {"merkle_root","range","ts"}
+        self._packed = 0              # 已打包条目数(range 起点)
+        self.last_pack_ts = 0.0       # 上次打包时刻(now 同口径,构造时 0.0)
 
     def append(self, entry_type: str, payload_digest: str, timestamp: str) -> dict:
         entry = {
@@ -62,6 +68,9 @@ class HashChain:
         })
         self.entries.append(entry)
         self._prev = entry["hash"]
+        # 计数触发自动打包(≥ PACK_EVERY 条未打包);时间触发只经 maybe_pack(now)
+        if len(self.entries) - self._packed >= self.PACK_EVERY:
+            self._pack(time.monotonic())
         return entry
 
     @property
@@ -80,3 +89,32 @@ class HashChain:
                 return False
             prev = expected
         return prev == self._prev
+
+    # ------------------------------------------------------------------ #
+    # Merkle 打包触发器(Task 12,SEC-PACK-1/2)
+    # ------------------------------------------------------------------ #
+    def maybe_pack(self, now: float, force: bool = False) -> dict | None:
+        """打包触发:未打包条目 ≥ PACK_EVERY 或距上次打包 ≥ 300 秒;force 立即。
+
+        无可打包条目返回 None。打包范围 = 未打包条目,Merkle 树叶子 = 各条目 hash。
+        """
+        unpacked = len(self.entries) - self._packed
+        if unpacked <= 0:
+            return None
+        if force or unpacked >= self.PACK_EVERY or now - self.last_pack_ts >= PACK_INTERVAL:
+            return self._pack(now)
+        return None
+
+    def _pack(self, now: float) -> dict:
+        start = self._packed
+        end = len(self.entries) - 1
+        leaves = [e["hash"] for e in self.entries[start:end + 1]]
+        pack = {
+            "merkle_root": MerkleTree(leaves).root,
+            "range": [start, end],
+            "ts": now,
+        }
+        self.packs.append(pack)
+        self._packed = end + 1
+        self.last_pack_ts = now
+        return pack
