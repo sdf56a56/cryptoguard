@@ -26,8 +26,10 @@ def test_bind6_escape_stability():
     assert canon({"k": "a\"b\\c\nd"}) == b'{"k":"a\\"b\\\\c\\nd"}'
 
 def test_bind6_numbers():
-    assert canon({"n": 1.0}) == canon({"n": 1.0})
-    # 整数与浮点 1.0 的序列化必须确定(同值同字节)
+    # rfc8785 uses ECMAScript number formatting: 1.0 -> "1", 1.5 -> "1.5"
+    assert canon({"n": 1}) == b'{"n":1}'
+    assert canon({"n": 1.0}) == b'{"n":1}'
+    assert canon({"n": 1.5}) == b'{"n":1.5}'
     assert canon({"n": 1}) != canon({"n": 1.5})
 
 def test_bind5_empty_and_blank():
@@ -36,3 +38,7 @@ def test_bind5_empty_and_blank():
 
 def test_h_hex_len():
     assert len(h_hex({"x": 1})) == 64
+
+def test_nfc_key_collision_rejected():
+    with pytest.raises(ValueError):
+        canon({"\u00e9": 1, "e\u0301": 2})   # NFC U+00E9 vs NFD e+U+0301
