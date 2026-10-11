@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+import secrets
 from dataclasses import dataclass, field
+
+from .tokens import (T1_DISPLAY_LEN, T2Cipher, StaticOPE,
+                     id_check_digit, luhn_digit, t1_pseudonym)
 
 # 实体类型元数据：前缀、中文名、识别方法、建议脱敏模式
 ENTITY_META: dict[str, dict] = {
@@ -72,6 +76,8 @@ _NAME_DICT = {
     "吴磊", "徐明", "孙丽", "马超", "朱婷", "胡军", "郭靖", "林丹", "何洁",
     "高翔", "罗琳", "郑爽", "梁静", "谢娜", "宋佳", "唐嫣", "韩雪", "曹颖",
     "许晴", "邓超", "冯巩", "彭于晏", "董卿", "潘长江", "袁隆平", "蒋雯丽",
+    # 裁定 R5:全项目演示/测试统一人名
+    "张三", "李四",
 }
 
 _ADDR_KEYS = ("省", "市", "区", "县", "镇", "街道", "路", "号", "小区", "医院", "银行", "大厦", "广场")
@@ -220,3 +226,134 @@ def detect_sensitive(
     result.mapping = {e.placeholder: e.value for e in result.entities}
     result.restore_map = {getattr(e, "replacement", e.placeholder): e.value for e in result.entities}
     return result
+
+
+# --------------------------------------------------------------------------- #
+# 实体 → 分级令牌管线(Task 10:tiered token pipeline)
+#
+# T1 共指由同 key+salt 的确定性 HMAC 自然保证(同值同令牌),刻意不做查表去重。
+# 安全目标:出站只见令牌不见明文;泄漏按 tier 显式声明(leak_class)。
+# 明确不承诺:低置信度实体带 pending 待人工确认,漏检实体仍明文出站。
+# --------------------------------------------------------------------------- #
+
+TIER_ENUM = frozenset({"T1", "T2", "T3", "T4"})
+
+# 实体类型 → 分级(裁定 R20:tier_for 只出此固定枚举,绝不回显输入)
+_TIER_MAP: dict[str, str] = {
+    # T1 不透明伪名(自由文本/标识符;EMAIL/IP/URL/APIKEY 亦归 T1 保守隐藏)
+    "NAME": "T1", "ORG": "T1", "PROJECT": "T1", "PHI": "T1",
+    "ADDRESS": "T1", "PII": "T1", "FNAME": "T1",
+    "EMAIL": "T1", "IP": "T1", "URL": "T1", "APIKEY": "T1",
+    # T2 格式保留(结构化号码,补校验位)
+    "ID": "T2", "CARD": "T2", "PHONE": "T2",
+    # T3 保序(数值类,显式泄漏序关系)
+    "NUM": "T3", "NUMBER": "T3", "NUMERIC": "T3", "AMOUNT": "T3",
+}
+
+# 各档显式泄漏类别(UI 徽章「⚠️ 泄漏:…」同源口径)
+_TIER_LEAK = {"T1": "等值性", "T2": "格式+等值性", "T3": "序关系+等值性", "T4": "密文形态"}
+
+_PENDING_CONFIDENCE = 0.6   # confidence < 0.6 → pending 人工确认
+
+
+def tier_for(entity_type: str) -> str:
+    """实体类型 → 令牌分级,只返回固定枚举 T1/T2/T3/T4(裁定 R20)。
+
+    未知类型(含注入尝试)fail-safe 落 T1 —— 不透明伪名是最保守档:
+    既保证只出枚举不回显输入,也不会因异常类型把明文放行。
+    """
+    return _TIER_MAP.get(str(entity_type).strip().upper(), "T1")
+
+
+@dataclass
+class Tokenizers:
+    """会话级令牌密钥聚合:proxy 注入自己的 key/salt,default() 随机生成(测试/演示)。"""
+    k_t1: bytes
+    session_salt: bytes
+    t2: T2Cipher
+    ope: StaticOPE | None = None
+
+    @classmethod
+    def default(cls) -> "Tokenizers":
+        return cls(
+            k_t1=secrets.token_bytes(32),
+            session_salt=secrets.token_bytes(16),
+            t2=T2Cipher(secrets.token_bytes(32)),
+        )
+
+
+@dataclass
+class TokenEntity:
+    type: str          # 实体类型
+    value: str         # 原始明文(仅本地持有)
+    token: str         # 令牌主形态
+    tier: str          # T1/T2/T3/T4(裁定 R20 枚举)
+    leak_class: str    # 显式泄漏类别
+    replacement: str   # 文内替换形态
+    pending: bool      # 低置信度(<0.6)待人工确认
+
+
+def _t2_token(etype: str, value: str, t2: T2Cipher) -> str:
+    """T2 格式保留令牌:核心位段 FPE + 补校验位 → 完整展示串。"""
+    if etype == "ID":
+        enc = t2.encrypt_id17(value[:17])
+        return enc + id_check_digit(enc)       # 18 位,ISO 7064 MOD 11-2 修复
+    if etype == "CARD":
+        # 卡面按行业标准 16 位:前 15 位 FPE + Luhn 修复;短卡号左补零(演示妥协)
+        core = value[:15] if len(value) >= 15 else value.zfill(15)
+        enc = t2.encrypt_card15(core)
+        return enc + luhn_digit(enc)
+    if etype == "PHONE":
+        # 11 位手机:前 2 位号段保留,后 9 位 FPE(无校验位)
+        return value[:2] + t2.encrypt_phone_tail9(value[2:11])
+    raise ValueError(f"无 T2 映射的实体类型: {etype}")
+
+
+def _t3_token(value: str, ope: StaticOPE | None) -> str:
+    """T3 保序令牌:数值 → StaticOPE 编码整数的字符串形态。"""
+    if ope is None:
+        raise ValueError("T3 需要注入 StaticOPE(Tokenizers.ope)")
+    try:
+        n = int(value)
+    except ValueError:
+        digits = re.sub(r"\D", "", value)
+        if not digits:
+            raise ValueError(f"T3 数值解析失败: {value!r}")
+        n = int(digits)
+    return str(ope.encrypt(n))
+
+
+def tokenize_entities(entities: list[Entity], tok: Tokenizers) -> list[TokenEntity]:
+    """实体列表 → 分级令牌(按 tier_for 分派 T1/T2/T3)。
+
+    T1 共指 = 同 key+salt 确定性 HMAC 自然保证,无查表去重逻辑。
+    """
+    out: list[TokenEntity] = []
+    for e in entities:
+        tier = tier_for(e.type)
+        if tier == "T1":
+            token = t1_pseudonym(tok.k_t1, e.type, e.value, tok.session_salt)
+            replacement = f"[{e.type}#{token[:T1_DISPLAY_LEN]}]"
+        elif tier == "T2":
+            token = _t2_token(e.type, e.value, tok.t2)
+            replacement = token               # 格式保留串(含修复校验位)直接顶替
+        elif tier == "T3":
+            token = _t3_token(e.value, tok.ope)
+            replacement = token               # 保序编码整数的字符串形态
+        else:  # T4 同态:枚举保留位,不在实体令牌管线
+            raise ValueError(f"{tier} 同态令牌不在实体令牌管线")
+        out.append(TokenEntity(
+            type=e.type,
+            value=e.value,
+            token=token,
+            tier=tier,
+            leak_class=_TIER_LEAK[tier],
+            replacement=replacement,
+            pending=e.confidence < _PENDING_CONFIDENCE,
+        ))
+    return out
+
+
+def filename_token(name: str, tok: Tokenizers) -> str:
+    """文件名 → T1 伪名(FNAME 类型,同会话同值共指)。"""
+    return t1_pseudonym(tok.k_t1, "FNAME", name, tok.session_salt)
