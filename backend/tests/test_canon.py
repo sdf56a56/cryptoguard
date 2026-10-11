@@ -8,9 +8,19 @@ def test_bind2_key_order_stability():
     assert canon(a) == canon(b)
 
 def test_bind6_unicode_nfc_nfd():
-    nfc = {"k": "é"}          # é = é
-    nfd = {"k": "é"}         # e + ́
+    nfc = {"k": "\u00e9"}          # e-acute precomposed (U+00E9)
+    nfd = {"k": "\u0065\u0301"}  # e + combining acute (U+0065 U+0301)
     assert canon(nfc) == canon(nfd)
+
+def test_cross_check_canonicaljson():
+    try:
+        from rfc8785 import dumps as _rfc_dumps
+        from canonicaljson import encode_canonical_json as _cj_dumps
+    except ImportError:  # pragma: no cover
+        return  # 两库未同时安装时跳过交叉校验
+    simple = {"a": "b", "c": 1}
+    assert canon(simple) == _cj_dumps(simple)
+    assert _rfc_dumps(simple) == _cj_dumps(simple)
 
 def test_bind6_escape_stability():
     assert canon({"k": "a\"b\\c\nd"}) == b'{"k":"a\\"b\\\\c\\nd"}'
