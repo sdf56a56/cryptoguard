@@ -544,6 +544,12 @@ class CryptoGuard:
             "forge_cert": "模型身份验证失败：model_cert 审计签名无效",
             "tamper_log": "可审计日志验证失败：Merkle 证明不通过",
             "repudiate": "用户诬告：input_hash 与用户声称的输入不绑定",
+            # 裁定 R9 九攻击接线(沙箱演示文案,详见 app/sandbox.py)
+            "repudiate_user": "输入绑定验证失败：用户声称的输入与留痕 input_hash 不绑定",
+            "repudiate_provider": "响应完整性验证失败：服务商否认签名所绑输出",
+            "swap_token": "输入绑定验证失败：出站令牌被偷换，input_hash 不匹配",
+            "swap_file": "输入绑定验证失败：文件内容被偷换，input_hash 不匹配",
+            "bad_directive": "计算网关拒绝：越权指令不在出站 token_index 白名单",
         }.get(attack)
 
     # ------------------------------------------------------------------ #
