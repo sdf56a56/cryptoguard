@@ -32,3 +32,9 @@ def test_phone_tail():
 
 def test_different_plaintext_different_cipher():
     assert c.encrypt_id17("11010519491231002") != c.encrypt_id17("11010519491231003")
+
+def test_id_check_digit_known_answers():
+    # 已知答案钉:17 位身份证前缀的校验位(ISO 7064 MOD 11-2)
+    assert id_check_digit("11010519491231002") == "X"
+    assert id_check_digit("11010519491231001") == "1"
+    assert id_check_digit("11010519491231003") == "8"
