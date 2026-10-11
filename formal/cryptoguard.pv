@@ -1,0 +1,121 @@
+(* ==================================================================== *)
+(* CryptoGuard-LLM 四层协议模型                                          *)
+(* 字段对照:formal/FIELD_MAP.md;查询与预期:formal/EXPECTED_RESULTS.md   *)
+(* 建模(spec §6.4-A):层1 输入绑定(token_root/input_hash/override)、    *)
+(* 层2 model_cert 签名链、层3 响应签名 + 域分隔、层4 哈希链前向完整性、   *)
+(* 防重放(nonce 单次使用状态)。                                         *)
+(* 不建模(诚实边界):NLP 检测质量、T3 声明泄漏函数、T4 与计算网关、      *)
+(* 侧信道、密钥托管、OCR、服务商主动调包。                               *)
+(* ==================================================================== *)
+
+free c: channel.                  (* 公共网络:Dolev-Yao 攻击者 *)
+free clog: channel [private].     (* 本地审计日志链(层4),不可被读写 *)
+free cvault: channel [private].   (* 本地映射表保险库(AES-GCM 简化为 senc) *)
+
+type skey.
+type pkey.
+
+(* ---- 密码原语(签名 / 对称加密 / 哈希 / HMAC) ---- *)
+fun sign(bitstring, skey): bitstring.
+fun pk(skey): pkey.
+reduc forall m: bitstring, k: skey; verify(sign(m, k), m, pk(k)) = true.
+
+fun senc(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; sdec(senc(m, k), k) = m.
+
+fun hash(bitstring): bitstring.
+fun hmac(bitstring, bitstring): bitstring.
+
+(* ---- 协议字段构造(元数 == 代码哈希前映像字段数,见 FIELD_MAP.md) ---- *)
+fun tokroot(bitstring, bitstring): bitstring.
+fun inputhash(bitstring, bitstring, bitstring, bitstring, bitstring, bitstring, bitstring): bitstring.
+fun cert(bitstring, bitstring, bitstring, bitstring): bitstring.
+fun resp_hash(bitstring, bitstring, bitstring, bitstring, bitstring, bitstring): bitstring.
+fun logent(bitstring, bitstring, bitstring, bitstring, bitstring): bitstring.
+
+(* ---- 域分隔常量(对应 tokenchain.py 的 D_INPUT/D_RESP/D_LOG 标签) ---- *)
+free d_input: bitstring.
+free d_resp: bitstring.
+free d_log: bitstring.
+free d_query: bitstring.
+
+(* ---- 密钥与明文(私有:永不出本地) ---- *)
+private free sk_provider: skey.      (* 服务商签名私钥 *)
+private free sk_auditor: skey.       (* 审计机构私钥 *)
+private free vault_key: skey.        (* 映射表保险库密钥 *)
+private free k_t1: bitstring.        (* T1 伪名 HMAC 密钥 *)
+private free plain_secret: bitstring. (* 明文敏感数据,出站前必被令牌化 *)
+
+(* ---- 事件 ---- *)
+event req_sent(bitstring).
+event provider_sign(bitstring).
+event resp_accept(bitstring).
+event cert_issued(bitstring).
+event cert_accept(bitstring).
+event nonce_reused(bitstring).
+
+(* nonce 单次使用状态(spec §6.4-C 查询 3):接受侧查表防复用 *)
+table acceptedNonce(bitstring).
+
+(* ---- 角色过程(内联于 process,避免 let 零参进程定义的版本差异) ---- *)
+
+(* ---- 验证查询(spec §6.4-C 合法语法;预期 RESULT 见 EXPECTED_RESULTS.md) ---- *)
+(* 1. 无服务商私钥不能伪造响应 *)
+query attacker(sk_provider).
+query x: bitstring; event(resp_accept(x)) ==> event(provider_sign(x)).
+(* 2. 无审计机构私钥不能伪造模型声明 *)
+query x: bitstring; event(cert_accept(x)) ==> event(cert_issued(x)).
+(* 3. 防重放:nonce 复用不可达(单次使用状态建模) *)
+query n: bitstring; event(nonce_reused(n)).
+(* 4. 映射表密钥不出本地 *)
+query attacker(vault_key).
+(* 5. 出站包无明文敏感数据 *)
+query attacker(plain_secret).
+
+process:
+  (* 审计机构:签发 model_cert(4 元),仅 sk_auditor 能签发 *)
+  (new mid: bitstring;
+   new ver: bitstring;
+   new rd: bitstring;
+   new mh: bitstring;
+   let cp = cert(mid, ver, rd, mh) in
+   event cert_issued(cp);
+   out(c, (cp, sign(cp, sk_auditor))))
+  |
+  (* 用户侧网关:本地令牌化 -> token_root/input_hash 绑定 -> 出站 ->
+     验 model_cert -> 验响应签名 -> nonce 单次使用查表 -> resp_accept *)
+  (! new sid: bitstring;
+   new nonce: bitstring;
+   new ts: bitstring;
+   new fred: bitstring;
+   new ovs: bitstring;
+   out(cvault, senc(plain_secret, vault_key));
+   let tok = hmac(k_t1, plain_secret) in
+   let root = tokroot(hash(sid), tok) in
+   let t = hash(tok) in
+   let fch = hash(fred) in
+   let ovh = hash(ovs) in
+   let ih = inputhash(d_input, t, fch, root, ovh, nonce, ts) in
+   event req_sent(ih);
+   out(c, (ih, root, nonce, ts));
+   in(c, (rh: bitstring, sig: bitstring, cp: bitstring, casig: bitstring,
+          rnonce: bitstring, rts: bitstring));
+   if verify(casig, cp, pk(sk_auditor)) = true then
+     event cert_accept(cp);
+     if verify(sig, rh, pk(sk_provider)) = true then
+       if rnonce = nonce then
+         (get acceptedNonce(=nonce) in
+            (event nonce_reused(nonce); 0)
+          else
+            (insert acceptedNonce(nonce);
+             out(clog, logent(d_log, d_query, ih, ts, hash(rh)));
+             event resp_accept(rh); 0)))
+  |
+  (* 服务端:只对绑定 input_hash/nonce 的请求签响应;provider_sign 先于出站 *)
+  (! in(c, (ih: bitstring, root: bitstring, nonce: bitstring, ts: bitstring));
+   in(c, (cp: bitstring, casig: bitstring));
+   if verify(casig, cp, pk(sk_auditor)) = true then
+     new o: bitstring;
+     let rh = resp_hash(d_resp, o, ih, cp, nonce, ts) in
+     event provider_sign(rh);
+     out(c, (rh, sign(rh, sk_provider), cp, casig, nonce, ts)))
