@@ -95,8 +95,13 @@ _Hex64 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 _IsoUtcMicro = Annotated[str, Field(
     pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")]
 
-# 出站令牌显示格式:[TYPE#token],用于网关规则 1 的正文/文件扫描
-_TOKEN_REF_RE = re.compile(r"\[([A-Za-z0-9_]+)#([^\]#\s]+)\]")
+# 出站令牌文法(网关规则 1 扫描,裁定 R24,唯一正典形态):
+#   显示形态 [TYPE#token]:ASCII 方括号,TYPE=[A-Za-z0-9_]+,tok=[A-Za-z0-9]+;
+#   裸形态:26 位小写 base32 连续串([a-z2-7]{26},T1 全量令牌),视为无 TYPE 的令牌引用。
+# 全角括号 ［］先归一化为 ASCII 再扫描(封堵全角括号绕过)。
+_TOKEN_REF_RE = re.compile(r"\[([A-Za-z0-9_]+)#([A-Za-z0-9]+)\]")
+_BARE_TOKEN_RE = re.compile(r"[a-z2-7]{26}")
+_FW_BRACKETS = str.maketrans({"［": "[", "］": "]"})
 
 
 class TokenRef(BaseModel):
@@ -172,15 +177,47 @@ class ComputeDirectiveModel(BaseModel):
     result_ref: str
 
 
+def _payload_fhashes(fps: list[FilePayload]) -> list:
+    """input_hash 的文件哈希序列(build_outbound 与 verify_outbound 共用同口径)。
+
+    裁定 R24:readable 级恒按 redacted_content 重算 —— 声明的 file_content_hash
+    只做一致性校验,不得覆盖内容哈希,否则"改内容留旧哈希"可绕过规则 3;
+    evidence 级无内容,声明的 file_content_hash 原样进哈希序列。
+    """
+    out: list = []
+    for p in fps:
+        if p.content_tier == "readable":
+            out.append(_file_content_hash(p.redacted_content or ""))
+        else:
+            out.append(p.file_content_hash)
+    return out
+
+
+def _token_whitelisted(tok: str, typ: str | None, index: list[TokenRef]) -> bool:
+    """前缀感知白名单(裁定 R24):tok 与 t.token 全等或互为前缀即同一令牌引用。
+
+    显示形态须 TYPE 匹配;TYPE 匹配时任意长度前缀(含 5 字符前缀)是对
+    同一令牌的合法引用(显示形态本身就是 10 字符前缀)。裸形态无 TYPE,
+    任意 TokenRef 命中前缀/全等关系即通过。
+    """
+    for t in index:
+        if typ is not None and t.type != typ:
+            continue
+        if tok == t.token or t.token.startswith(tok) or tok.startswith(t.token):
+            return True
+    return False
+
+
 def build_outbound(*, session_id: str, redacted_text: str,
                    file_payloads: list, token_index: list,
                    override_events: list, nonce: str,
                    timestamp: str) -> OutboundRequest:
     """出站包唯一拼装入口(后端模板)。
 
-    内部计算 token_root(token_chain)、override_hash、readable 文件的
-    file_content_hash、input_hash,并按 R8 附带 canonical_preimage(展示用,
-    不参与 input_hash)。
+    内部计算 token_root(token_chain)、override_hash、文件哈希序列
+    (readable 级恒按 redacted_content 重算,声明 file_content_hash 不得覆盖
+    内容哈希 —— 裁定 R24)、input_hash,并按 R8 附带 canonical_preimage
+    (展示用,不参与 input_hash)。
     """
     fps = [p if isinstance(p, FilePayload) else FilePayload(**p)
            for p in file_payloads]
@@ -191,8 +228,7 @@ def build_outbound(*, session_id: str, redacted_text: str,
 
     root = token_chain(session_id, [(t.type, t.token) for t in tis])
     ov_h = override_hash([e.model_dump() for e in ovs])
-    fhashes = [p.file_content_hash or _file_content_hash(p.redacted_content or "")
-               for p in fps if p.content_tier == "readable"]
+    fhashes = _payload_fhashes(fps)
     preimage = input_hash_preimage(redacted_text, fhashes, root, ov_h,
                                    nonce, timestamp)
     ih = _input_hash(redacted_text, fhashes, root, ov_h, nonce, timestamp)
@@ -215,21 +251,32 @@ def verify_outbound(req: OutboundRequest, k_t1: bytes, session_salt: bytes,
                     token_values: dict[str, tuple[str, str]] | None = None) -> list[str]:
     """网关三规则(spec §3.2),返回违规列表(空=放行)。
 
-    1. 正文/文件中出现的所有令牌 ⊆ token_index;
+    1. 正文/文件中出现的所有令牌 ⊆ token_index(前缀感知,裁定 R24:
+       显示形态 [TYPE#tok] 与裸 26 位 base32 均视为令牌引用,
+       全角括号 ［］归一化为 ASCII 后扫描;TYPE 匹配时任意前缀即合法引用);
     2. T1 令牌 HMAC 重算与声明一致(仅当提供 token_values:token -> (type, value));
-    3. input_hash 从请求字段重算一致。
+    3. input_hash 从请求字段重算一致;readable 文件哈希恒按内容重算,
+       声明 file_content_hash 与内容不一致即违规(裁定 R24)。
     """
     violations: list[str] = []
 
-    # 规则 1:正文/文件令牌 ⊆ token_index(防中间层塞私货令牌)
-    known = {t.token for t in req.token_index}
+    # 规则 1:正文/文件令牌 ⊆ token_index(防中间层塞私货令牌)。
+    # 显示形态 + 裸 26 位 base32 两种形态都进闸,全角括号归一化后扫描,
+    # 白名单为前缀感知(裁定 R24)。
     texts = [req.redacted_text]
     texts += [p.redacted_content for p in req.file_payloads
               if p.redacted_content is not None]
     seen: set[str] = set()
     for text in texts:
-        for _typ, tok in _TOKEN_REF_RE.findall(text):
-            if tok not in known and tok not in seen:
+        norm = text.translate(_FW_BRACKETS)
+        for typ, tok in _TOKEN_REF_RE.findall(norm):
+            if (tok not in seen
+                    and not _token_whitelisted(tok, typ, req.token_index)):
+                seen.add(tok)
+                violations.append(f"令牌 {tok} 不在 token_index")
+        for tok in _BARE_TOKEN_RE.findall(norm):
+            if (tok not in seen
+                    and not _token_whitelisted(tok, None, req.token_index)):
                 seen.add(tok)
                 violations.append(f"令牌 {tok} 不在 token_index")
 
@@ -245,9 +292,17 @@ def verify_outbound(req: OutboundRequest, k_t1: bytes, session_salt: bytes,
             if t1_pseudonym(k_t1, typ, value, session_salt) != t.token:
                 violations.append(f"令牌 {t.token} HMAC 与声明不一致")
 
-    # 规则 3:input_hash 重算一致(出站包未被偷换)
-    fhashes = [p.file_content_hash or _file_content_hash(p.redacted_content or "")
-               for p in req.file_payloads if p.content_tier == "readable"]
+    # 规则 3:input_hash 重算一致(出站包未被偷换)。
+    # readable 文件哈希恒按 redacted_content 重算(裁定 R24):声明的
+    # file_content_hash 与内容不一致即违规,且不得参与 input_hash 重算,
+    # 否则"改内容留旧声明哈希"会让 input_hash 依旧吻合(BIND-3/SEC-ATK-7)。
+    for p in req.file_payloads:
+        if p.content_tier != "readable":
+            continue
+        recomputed = _file_content_hash(p.redacted_content or "")
+        if p.file_content_hash is not None and p.file_content_hash != recomputed:
+            violations.append(f"文件 {p.file_ref} file_content_hash 与内容不一致")
+    fhashes = _payload_fhashes(req.file_payloads)
     root = token_chain(req.session_id, [(t.type, t.token) for t in req.token_index])
     ov_h = override_hash([e.model_dump() for e in req.override_events])
     if _input_hash(req.redacted_text, fhashes, root, ov_h,
