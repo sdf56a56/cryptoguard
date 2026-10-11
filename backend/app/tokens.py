@@ -7,8 +7,10 @@ T1 安全目标:伪名不可区分(HMAC PRF),同会话共指,跨会话不可关�
 """
 from __future__ import annotations
 import base64
+import bisect
 import hashlib
 import hmac
+import secrets as _secrets
 import time
 
 T1_DISPLAY_LEN = 10
@@ -107,3 +109,44 @@ def ff1_unit_ms_p95(c: "T2Cipher", n: int = 1000) -> float:
         samples.append((time.perf_counter() - t0) * 1000)
     samples.sort()
     return samples[int(n * 0.95)]
+
+
+# ---------------------------------------------------------------------------
+# T3:静态保序令牌(≤20 个数值)+ 分桶降级
+# ---------------------------------------------------------------------------
+
+
+class StaticOPE:
+    """简化保序编码:演示前固定 ≤20 个数值,秩+随机间隔,单调保序。
+    显式泄漏:序关系 + 等值性(UI 徽章 ⚠️ 泄漏:序关系)。不支持动态插入。"""
+    LEAK = "序关系+等值性"
+    MAX_VALUES = 20
+
+    def __init__(self, values: list[int]):
+        if len(set(values)) > self.MAX_VALUES:
+            raise ValueError("静态集合上限 20 个数值(spec §1.3)")
+        self._enc: dict[int, int] = {}
+        rank = 0
+        for v in sorted(set(values)):
+            rank += 1 + _secrets.randbelow(64)     # 随机间隔
+            self._enc[v] = rank
+        self._dec = {r: v for v, r in self._enc.items()}
+
+    def encrypt(self, v: int) -> int:
+        if v not in self._enc:
+            raise KeyError(f"{v} 不在静态集合内,不支持动态插入")
+        return self._enc[v]
+
+    def decrypt(self, e: int) -> int:
+        return self._dec[e]
+
+
+class BucketOPE:
+    """分桶保序降级:仅泄漏桶序,桶边界公开声明。"""
+    LEAK = "桶序"
+
+    def __init__(self, bounds: list[int]):
+        self._bounds = sorted(bounds)
+
+    def encrypt(self, v: int) -> int:
+        return bisect.bisect_right(self._bounds, v)
