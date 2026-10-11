@@ -1,19 +1,23 @@
 """
-Mock 大模型 API —— 接收脱敏输入，返回输出 + 四层可验证信息
+Mock 大模型 API —— 接收出站包(OutboundRequest dump),返回输出 + 四层可验证信息
 
-支持攻击注入（用于演示）：
-  - tamper       篡改输出（签名/哈希不一致）
-  - replay       重放旧响应（nonce 不匹配）
-  - forge_cert   伪造模型声明（审计机构签名失败）
-  - tamper_log   篡改日志（Merkle 证明失败）
-  - repudiate    用户诬告（input_hash 绑定失败）
+R7:respond(req_dump, attack) 自带 50–100ms 随机延迟(mock_sleep_ms 随返回),
+response_hash 走 tokenchain.response_hash(JCS 域分隔,spec §3.1)。
+
+支持攻击注入(用于演示):
+  - tamper       篡改输出(签名/哈希不一致)
+  - replay       重放旧响应(nonce 不匹配)
+  - forge_cert   伪造模型声明(审计机构签名失败)
+  - tamper_log   篡改日志(Merkle 证明失败)
+  - repudiate    用户诬告(input_hash 绑定失败)
 """
 from __future__ import annotations
 
-import hashlib
+import secrets as _secrets
 import time
 
 from .crypto.signatures import Ed25519Signer
+from .tokenchain import response_hash as _jcs_response_hash
 
 
 class MockLLM:
@@ -22,21 +26,27 @@ class MockLLM:
         self.provider_public_b64 = self.provider_signer.public_b64
         self.model_cert = auditor_cert
         self.model_name = model_name
-        self._nonce_store: dict[str, str] = {}  # input_hash -> 上次 nonce（防重放）
+        self._nonce_store: dict[str, str] = {}   # input_hash -> 上次 nonce(防重放)
+        self._last_timestamp: dict[str, str] = {}
 
-    def respond(self, redacted_input: str, input_hash: str, nonce: str,
-                timestamp: str, attack: str | None = None) -> dict:
+    def respond(self, req_dump: dict, attack: str | None = None) -> dict:
+        """按出站包生成响应(R7 新签名:自带随机 sleep,返回 mock_sleep_ms)。"""
+        mock_sleep_ms = _secrets.randbelow(51) + 50      # 50–100ms
+        time.sleep(mock_sleep_ms / 1000)
+
+        redacted_input = req_dump["redacted_text"]
+        input_hash = req_dump["input_hash"]
+        nonce = req_dump["nonce"]
+        timestamp = req_dump["timestamp"]
         output = self._generate(redacted_input)
 
-        # 重放攻击：如果曾处理过该 input_hash，复用旧 nonce
+        # 重放攻击:如果曾处理过该 input_hash,复用旧 nonce/时间戳
         if attack == "replay":
-            old_nonce = self._nonce_store.get(input_hash, nonce)
+            nonce_used = self._nonce_store.get(input_hash, nonce)
             timestamp = self._last_timestamp.get(input_hash, timestamp)
-            nonce_used = old_nonce
         else:
             nonce_used = nonce
             self._nonce_store[input_hash] = nonce
-            self._last_timestamp = getattr(self, "_last_timestamp", {})
             self._last_timestamp[input_hash] = timestamp
 
         # 伪造证书攻击
@@ -48,7 +58,7 @@ class MockLLM:
         response_hash = self._response_hash(output, input_hash, cert, nonce_used, timestamp)
         signature = self.provider_signer.sign(response_hash.encode("utf-8"))
 
-        # 篡改攻击：传输中被中间人篡改输出，但哈希/签名仍对应原始输出 → 验证失败
+        # 篡改攻击:传输中被中间人篡改输出,但哈希/签名仍对应原始输出 → 验证失败
         if attack == "tamper":
             output = output + " [已篡改内容]"
 
@@ -60,18 +70,18 @@ class MockLLM:
             "provider_public_key": self.provider_public_b64,
             "nonce": nonce_used,
             "timestamp": timestamp,
+            "mock_sleep_ms": mock_sleep_ms,
         }
 
     @staticmethod
     def _response_hash(output: str, input_hash: str, cert: dict,
                        nonce: str, timestamp: str) -> str:
-        cert_canonical = "|".join(f"{k}={cert[k]}" for k in sorted(cert) if k != "signature")
-        raw = "||".join([output, input_hash, cert_canonical, nonce, timestamp])
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        # R7:JCS 域分隔哈希(spec §3.1),委托 tokenchain
+        return _jcs_response_hash(output, input_hash, cert, nonce, timestamp)
 
     @staticmethod
     def _generate(redacted_input: str) -> str:
-        # 演示：基于占位符的模板回复
+        # 演示:基于占位符的模板回复
         n_placeholders = redacted_input.count("[")
         if n_placeholders:
             return f"已收到您的请求（含 {n_placeholders} 个受保护字段），处理完成：根据脱敏上下文，相关结果已安全返回。"
