@@ -5,20 +5,31 @@ FastAPI 主应用：提供密码学 API + 托管前端静态资源。
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import time
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import (FastAPI, File, Form, HTTPException, UploadFile,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
+from .concurrency import run_sync
+from .files import evidence_bundle
+from .gateway import GatewayReject, aggregate, validate_directive
 from .proxy import guard
+from .sandbox import ATTACKS, AttackSandbox
 from .schemas import (
     DetectRequest, QueryRequest, SSESearchRequest, HEStatsRequest, PolicyUpdate,
+    QueryV2Request, AttackInjectRequest, ComputeRequest,
 )
 
 app = FastAPI(title="CryptoGuard", version="1.0.0")
+
+# 模块级唯一攻击沙箱(R9/SEC-ISO):attack/reset 都走它
+sandbox = AttackSandbox(guard)
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,6 +92,99 @@ def proxy_query(req: QueryRequest):
         attack=req.attack,
     )
     return result
+
+
+# ------------------------------------------------------------------ #
+# CG/2.0 路由(Task 14):CPU 密集处理器经 run_in_executor(run_sync)
+# ------------------------------------------------------------------ #
+
+@app.post("/api/proxy/query2")
+async def proxy_query2(req: QueryV2Request):
+    """CG/2.0 主入口(裁定 R7):校验 → run_in_executor(query_v2)。"""
+    files = None
+    if req.files:
+        files = [{"filename": f.filename,
+                  "data": base64.b64decode(f.content_b64)} for f in req.files]
+    try:
+        result = await run_sync(guard.query_v2, req.text, files,
+                                req.overrides, req.scenario, req.directive)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
+
+
+@app.post("/api/files/upload")
+async def files_upload(file: UploadFile = File(...),
+                       filename_token_hint: str = Form("")):
+    """文件双通道上传:extract → route → evidence_bundle / readable 摘要。"""
+    from .detection import Tokenizers, filename_token
+
+    data = await file.read()
+    filename = file.filename or "upload.bin"
+
+    def _process():
+        from .files import extract_text, route_file
+        text, extractor = extract_text(data, filename)
+        tier = route_file(filename, text)
+        ftok = filename_token_hint or filename_token(filename, Tokenizers.default())
+        if tier == "evidence":
+            bundle = evidence_bundle(data, filename, guard.aead,
+                                     filename_token=ftok)
+            return {"content_tier": "evidence", "extractor": extractor,
+                    **{k: bundle[k] for k in ("file_hash", "file_content_hash",
+                                              "vault_ct", "filename_token")}}
+        return {"content_tier": "readable", "extractor": extractor,
+                "filename_token": ftok,
+                "file_hash": hashlib.sha256(data).hexdigest(),
+                "text_excerpt": text[:200], "text_chars": len(text)}
+
+    return await run_sync(_process)
+
+
+@app.post("/api/attack/inject")
+async def attack_inject(req: AttackInjectRequest):
+    """注入一种攻击(沙箱副本上模拟,主状态零污染,R9)。"""
+    if req.attack not in ATTACKS:
+        raise HTTPException(status_code=404,
+                            detail=f"未知攻击名(可选 {ATTACKS})")
+    return await run_sync(sandbox.attack, req.attack)
+
+
+@app.post("/api/attack/reset")
+async def attack_reset():
+    """恢复沙箱快照(SEC-ISO-2)。"""
+    def _reset():
+        sandbox.reset()
+        return {"ok": True, "restored": True}
+    return await run_sync(_reset)
+
+
+@app.post("/api/logs/pack")
+async def logs_pack():
+    """强制立即 Merkle 打包(Task 12 force 触发)。"""
+    def _pack():
+        pack = guard.chain.maybe_pack(time.monotonic(), force=True)
+        root = (pack or {}).get("merkle_root") or guard.logs()["merkle"]["root"]
+        return {"merkle_root": root,
+                "range": (pack or {}).get("range")}
+    return await run_sync(_pack)
+
+
+@app.post("/api/gateway/compute")
+async def gateway_compute(req: ComputeRequest):
+    """计算网关演示:白名单校验 + 聚合(spec §3.4)。"""
+    def _compute():
+        tiers = req.token_tiers or {t: "T3" for t in req.tokens}
+        try:
+            d = validate_directive(
+                {"op": req.op, "tokens": req.tokens,
+                 "result_ref": req.result_ref}, tiers)
+        except GatewayReject as ex:
+            return {"accepted": False, "reason": ex.reason}
+        vals = [(req.values or {}).get(t, 0) for t in d.tokens]
+        return {"accepted": True, "op": d.op, "result_ref": d.result_ref,
+                "result": aggregate(d.op, vals), "tokens": list(d.tokens)}
+    return await run_sync(_compute)
 
 
 @app.get("/api/logs")

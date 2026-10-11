@@ -177,6 +177,52 @@ class ComputeDirectiveModel(BaseModel):
     result_ref: str
 
 
+# =====================================================================
+# CG/2.0 API 入参(Task 14,裁定 R7)
+# =====================================================================
+
+class QueryFileRef(BaseModel):
+    """query2 内联文件引用(filename + base64 内容)。"""
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str
+    content_b64: str
+
+
+class QueryV2Request(BaseModel):
+    """POST /api/proxy/query2 入参(裁定 R7,schema_version 硬约束)。"""
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["CG/2.0"]
+    text: str
+    scenario: str = "medical"
+    files: Optional[list[QueryFileRef]] = None
+    overrides: Optional[list[dict]] = None
+    directive: Optional[dict] = None
+
+
+class AttackInjectRequest(BaseModel):
+    """POST /api/attack/inject 入参(裁定 R9 九攻击名)。"""
+    model_config = ConfigDict(extra="forbid")
+
+    attack: str
+
+
+class ComputeRequest(BaseModel):
+    """POST /api/gateway/compute 演示入参:指令 + 可选演示 tier/值映射。
+
+    token_tiers 缺省 = 请求令牌全部按 T3(演示白名单);显式给出时按
+    网关三规则严格校验(越权拒绝)。values 缺省 0(演示聚合值)。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["sum", "mean", "count", "min", "max"]
+    tokens: list[str]
+    result_ref: str
+    token_tiers: Optional[dict[str, str]] = None
+    values: Optional[dict[str, int]] = None
+
+
 def _payload_fhashes(fps: list[FilePayload]) -> list:
     """input_hash 的文件哈希序列(build_outbound 与 verify_outbound 共用同口径)。
 
