@@ -35,7 +35,7 @@ def validate_directive(raw: dict, token_index: dict[str, str]) -> ComputeDirecti
         if t not in token_index:
             raise GatewayReject(f"令牌 {t} 越权:不在出站 token_index 内")
         if token_index[t] not in AGGREGATE_TIERS:
-            raise GatewayReject(f"令牌 {t} tier={token_index[t]} 不允许聚合")
+            raise GatewayReject(f"令牌 {t} 越权:tier={token_index[t]} 不允许聚合")
     return ComputeDirective(op=op, tokens=tuple(tokens), result_ref=str(raw.get("result_ref", "")))
 
 
