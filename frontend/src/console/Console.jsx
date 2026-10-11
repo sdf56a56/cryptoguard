@@ -4,6 +4,10 @@ import TimingBar from "./TimingBar.jsx";
 import AppendixDrawer from "./AppendixDrawer.jsx";
 import Step1Input from "./Step1Input.jsx";
 import Step2Tokens from "./Step2Tokens.jsx";
+import Step3Outbound from "./Step3Outbound.jsx";
+import Step4Verify from "./Step4Verify.jsx";
+import Step5Attack from "./Step5Attack.jsx";
+import Step6Audit from "./Step6Audit.jsx";
 import { api, fileToBase64 } from "../api.js";
 import { BADGES } from "./badges.js";
 
@@ -177,11 +181,14 @@ export default function Console() {
             ff1Degraded={ff1Degraded}
           />
         )}
-        {state.step >= 3 && (
-          <div className="rounded-xl border border-line bg-surface p-8 text-center text-ink-soft text-[13px]">
-            步骤 {state.step} 视图 —— 后续任务填充(③出站包 ④四层验证 ⑤攻击注入 ⑥审计链)
-          </div>
+        {state.step === 3 && <Step3Outbound response={response} originalText={text} />}
+        {state.step === 4 && <Step4Verify response={response} />}
+        {state.step === 5 && (
+          <Step5Attack
+            onSandboxFlag={(on) => dispatch({ type: on ? "ATTACK_ON" : "ATTACK_OFF" })}
+          />
         )}
+        {state.step === 6 && <Step6Audit response={response} />}
       </main>
 
       <TimingBar
