@@ -165,8 +165,10 @@ def test_malformed_key_rejected(ctx, monkeypatch):
 # ---------- 规则 (c) 边界：key 在而指纹缺失 ----------
 
 def test_key_without_fingerprint_and_history_refuses(ctx, monkeypatch):
-    ctx.data_dir.mkdir(parents=True)
-    (ctx.data_dir / "messages.ndjson").write_text('{"type":"message"}\n', encoding="utf-8")
+    # 历史数据按真实数据布局放在 data/chain/seg-*.ndjson（子目录），非 data/ 顶层
+    seg = ctx.data_dir / "chain" / "seg-00001.ndjson"
+    seg.parent.mkdir(parents=True)
+    seg.write_text('{"type":"message"}\n', encoding="utf-8")
     monkeypatch.setenv("VAULT_KEY", KEY_A)
     with pytest.raises(VaultKeyError):
         Vault.load_or_init(ctx.data_dir, env_path=ctx.env_path)

@@ -147,7 +147,7 @@ class Vault:
                 if stored != fp:
                     raise VaultKeyError("密钥已变更，历史数据将不可解封")
             else:
-                if any(data_dir.glob("*.ndjson")):
+                if any(data_dir.rglob("*.ndjson")):
                     raise VaultKeyError(
                         "指纹文件缺失但存在历史数据（*.ndjson），"
                         "无法确认 VAULT_KEY 与历史数据同源，拒绝启动"
