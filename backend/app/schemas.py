@@ -253,6 +253,16 @@ class PreimageVerifyRequest(BaseModel):
     expected_hash: str
 
 
+class DegradeRequest(BaseModel):
+    """POST /api/acceptance/degrade 入参:三选一故障注入(network/protocol/stream)。
+
+    kind 保留自由串:未知类别由处理层白名单校验后 400(验收⑤,不走 422)。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+
+
 def _payload_fhashes(fps: list[FilePayload]) -> list:
     """input_hash 的文件哈希序列(build_outbound 与 verify_outbound 共用同口径)。
 

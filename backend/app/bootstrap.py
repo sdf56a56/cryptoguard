@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 _ENV_PATH_DEFAULT = Path(__file__).resolve().parent.parent / ".env"  # backend/.env
 
 
+def default_data_dir() -> Path:
+    """默认数据目录:repo 根 data/(lifespan 装配与验收 API 同一口径)。"""
+    return Path(__file__).resolve().parent.parent.parent / "data"
+
+
 def _mimo_api_key() -> str:
     """读取 MIMO_API_KEY:os.environ 优先,缺省回退 backend/.env;空值视为缺失。"""
     raw = os.environ.get("MIMO_API_KEY", "").strip()

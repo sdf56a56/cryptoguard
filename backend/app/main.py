@@ -14,7 +14,6 @@ import os
 import queue
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import (FastAPI, File, Form, HTTPException, Request, UploadFile,
                      WebSocket, WebSocketDisconnect)
@@ -22,7 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 
-from .bootstrap import build_chat_service
+from .acceptance import (degrade_demo, replay_report, run_golden,
+                         scan_plaintext_leaks)
+from .bootstrap import build_chat_service, default_data_dir
 from .canon import h_hex
 from .concurrency import run_sync
 from .crypto.merkle import MerkleTree
@@ -36,6 +37,7 @@ from .schemas import (
     DetectRequest, QueryRequest, SSESearchRequest, HEStatsRequest, PolicyUpdate,
     QueryV2Request, AttackInjectRequest, ComputeRequest,
     ChatSessionCreate, ChatMessageRequest, PreimageVerifyRequest,
+    DegradeRequest,
 )
 from .store import StoreIntegrityError
 
@@ -53,8 +55,7 @@ async def _lifespan(app_: FastAPI):
         yield
         return
     try:
-        app_.state.chat = build_chat_service(
-            Path(__file__).resolve().parent.parent.parent / "data")
+        app_.state.chat = build_chat_service(default_data_dir())
     except (VaultKeyError, StoreIntegrityError):
         logger.critical("启动失败:信任根/存储回放校验未通过,拒绝带病服务",
                         exc_info=True)
@@ -487,6 +488,37 @@ async def verify_preimage(req: PreimageVerifyRequest):
             "expected_hash": req.expected_hash,
             "recomputed_hash": recomputed,
             "match": recomputed == req.expected_hash}
+
+
+# ------------------------------------------------------------------ #
+# 验收 API(Task 12):/demo 验收抽屉数据源(spec §6.2/§6.3)
+# ------------------------------------------------------------------ #
+
+@app.get("/api/acceptance/golden")
+async def acceptance_golden():
+    """Golden Set 400 实测指标(混淆矩阵 + Wilson CI);CPU 密集走线程池。"""
+    return await run_sync(run_golden)
+
+
+@app.get("/api/acceptance/store-scan")
+async def acceptance_store_scan():
+    """SEC-STORE-1:扫数据目录明文泄漏键(user_view/reasoning_content/mapping)。"""
+    return await run_sync(scan_plaintext_leaks, default_data_dir())
+
+
+@app.get("/api/acceptance/replay")
+async def acceptance_replay():
+    """SEC-REPLAY-1:对活数据目录只读重建回放,返回计数或错误类别。"""
+    return await run_sync(replay_report, default_data_dir())
+
+
+@app.post("/api/acceptance/degrade")
+async def acceptance_degrade(req: DegradeRequest):
+    """SEC-DEGRADE-1:三选一故障注入,返回 spec §5 行为三元组;未知 kind → 400。"""
+    try:
+        return await run_sync(degrade_demo, req.kind)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # 托管前端构建产物（若存在）
