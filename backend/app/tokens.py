@@ -38,6 +38,7 @@ class T2Cipher:
     """FF1 格式保留加密。身份证前17位/卡号前15位/手机后9位。"""
 
     def __init__(self, key: bytes, tweak: bytes = b"cryptoguard"):
+        self._key = key  # 保留原始密钥(会话密钥序列化/重建用,如 sessions.py)
         try:
             from ff3 import FF3Cipher
             self._impl = "ff3"
@@ -52,6 +53,11 @@ class T2Cipher:
                 15: pyffx.String(key[:16], alphabet="0123456789", length=15),
                 9: pyffx.String(key[:16], alphabet="0123456789", length=9),
             }
+
+    @property
+    def key_bytes(self) -> bytes:
+        """原始密钥字节(只读):会话密钥序列化(hex)与异地重建 T2Cipher 用。"""
+        return self._key
 
     def encrypt_id17(self, v17: str) -> str:
         return self._enc(v17)
