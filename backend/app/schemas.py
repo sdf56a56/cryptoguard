@@ -223,6 +223,36 @@ class ComputeRequest(BaseModel):
     values: Optional[dict[str, int]] = None
 
 
+# =====================================================================
+# 聊天/查看器 API 入参(Task 9/10)
+# =====================================================================
+
+class ChatSessionCreate(BaseModel):
+    """POST /api/chat/sessions 入参:title 可选(缺省"新会话")。"""
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = None
+
+
+class ChatMessageRequest(BaseModel):
+    """POST /api/chat/sessions/{sid}/messages 入参:SSE 单流。
+
+    text 空白且无附件 → 400(与 run_turn 同判据);files 为 base64 内联附件。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = ""
+    files: Optional[list[QueryFileRef]] = None
+
+
+class PreimageVerifyRequest(BaseModel):
+    """POST /api/verify/preimage 入参:纯数据复算(服务端不下验证结论)。"""
+    model_config = ConfigDict(extra="forbid")
+
+    preimage: dict
+    expected_hash: str
+
+
 def _payload_fhashes(fps: list[FilePayload]) -> list:
     """input_hash 的文件哈希序列(build_outbound 与 verify_outbound 共用同口径)。
 

@@ -80,6 +80,19 @@ class ChatService:
         self._chain_log = chain_log  # 链写穿日志(SealedNDJSON)
 
     # ------------------------------------------------------------------ #
+    # 只读访问(Task 9/10 API 接线;写入仍经 run_turn)
+    # ------------------------------------------------------------------ #
+    @property
+    def sessions(self) -> SessionStore:
+        """会话存储只读访问(会话/查看器 API 消费)。"""
+        return self._sessions
+
+    @property
+    def chain(self) -> HashChain:
+        """哈希链只读访问(查看器 API 消费;入链仍经 run_turn)。"""
+        return self._chain
+
+    # ------------------------------------------------------------------ #
     # 主入口
     # ------------------------------------------------------------------ #
     def run_turn(self, session_id: str, text: str,

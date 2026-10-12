@@ -90,6 +90,10 @@ class SessionStore:
         """全部会话记录(latest rev 生效),按创建顺序;供会话侧栏/列表 API 消费。"""
         return list(self._latest_sessions().values())
 
+    def get_session(self, session_id: str) -> dict:
+        """按 id 取会话记录(latest rev);未知会话 ValueError。"""
+        return self._session_record(session_id)
+
     def _latest_sessions(self) -> dict[str, dict]:
         """id → 最新 rev 会话记录;同 id 多版本行时 latest rev 赢(按日志序)。"""
         latest: dict[str, dict] = {}

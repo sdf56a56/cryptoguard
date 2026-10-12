@@ -5,28 +5,64 @@ FastAPI 主应用：提供密码学 API + 托管前端静态资源。
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
+import logging
+import os
+import queue
 import time
+from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import (FastAPI, File, Form, HTTPException, UploadFile,
+from fastapi import (FastAPI, File, Form, HTTPException, Request, UploadFile,
                      WebSocket, WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
+from .bootstrap import build_chat_service
+from .canon import h_hex
 from .concurrency import run_sync
+from .crypto.merkle import MerkleTree
 from .files import evidence_bundle
 from .gateway import GatewayReject, aggregate, validate_directive
+from .keys import VaultKeyError
+from .llm import LLMFailure
 from .proxy import guard
 from .sandbox import ATTACKS, AttackSandbox
 from .schemas import (
     DetectRequest, QueryRequest, SSESearchRequest, HEStatsRequest, PolicyUpdate,
     QueryV2Request, AttackInjectRequest, ComputeRequest,
+    ChatSessionCreate, ChatMessageRequest, PreimageVerifyRequest,
 )
+from .store import StoreIntegrityError
 
-app = FastAPI(title="CryptoGuard", version="1.0.0")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _lifespan(app_: FastAPI):
+    """启动接线(Task 11):装配 ChatService 挂 app.state.chat。
+
+    VaultKeyError/StoreIntegrityError → logger.critical + 终止启动(fail-fast,
+    不带病服务);CG_NO_BOOT=1 时跳过装配(测试直挂 app.state.chat)。
+    """
+    if os.environ.get("CG_NO_BOOT") == "1":
+        yield
+        return
+    try:
+        app_.state.chat = build_chat_service(
+            Path(__file__).resolve().parent.parent.parent / "data")
+    except (VaultKeyError, StoreIntegrityError):
+        logger.critical("启动失败:信任根/存储回放校验未通过,拒绝带病服务",
+                        exc_info=True)
+        raise
+    yield
+
+
+app = FastAPI(title="CryptoGuard", version="1.0.0", lifespan=_lifespan)
 
 # 模块级唯一攻击沙箱(R9/SEC-ISO):attack/reset 都走它
 sandbox = AttackSandbox(guard)
@@ -264,8 +300,196 @@ async def ws_pipeline(ws: WebSocket):
         pass
 
 
+# ------------------------------------------------------------------ #
+# 聊天/查看器 API(Task 9/10):会话 CRUD、SSE 单流、链查看、独立复算
+# ------------------------------------------------------------------ #
+
+#: 会话级滑动窗口限流(单 worker,模块级即可):10 条 / 60 秒
+_RATE_MAX = 10
+_RATE_WINDOW_S = 60.0
+_chat_rate_hits: dict[str, list[float]] = {}
+
+#: /api/chain 的 verify() 结果缓存,(条数, root) 键变即失效(Task 10)
+_chain_verify_cache: dict[tuple[int, str], bool] = {}
+
+#: SSE 泵入器收尾哨兵
+_SENTINEL = object()
+
+
+def _rate_limited(session_id: str) -> bool:
+    """会话级滑动窗口限流:窗口内 ≥ _RATE_MAX 次则拒绝(计本次)。"""
+    now = time.monotonic()
+    hits = [t for t in _chat_rate_hits.get(session_id, [])
+            if now - t < _RATE_WINDOW_S]
+    if len(hits) >= _RATE_MAX:
+        _chat_rate_hits[session_id] = hits
+        return True
+    hits.append(now)
+    _chat_rate_hits[session_id] = hits
+    return False
+
+
+def _chain_valid_cached(service) -> bool:
+    """verify() 结果按 (条数, root) 缓存;入链即键变失效,免逐次重算整链。"""
+    key = (len(service.chain.entries), service.chain.root)
+    if key not in _chain_verify_cache:
+        _chain_verify_cache.clear()
+        _chain_verify_cache[key] = service.chain.verify()
+    return _chain_verify_cache[key]
+
+
+def _sse_frame(kind: str, data: dict) -> str:
+    """SSE 单帧:`event: <kind>` + `data: <json>`(UTF-8,可含中文)。"""
+    return f"event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _run_turn_pump(service, session_id: str, text: str, files: list,
+                   q: "queue.Queue") -> None:
+    """线程侧泵:run_turn 事件入队;异常映射 error 帧(fail-closed);哨兵收尾。"""
+    def on_event(kind: str, data: dict) -> None:
+        q.put((kind, data))
+
+    try:
+        service.run_turn(session_id, text, files, on_event)
+    except LLMFailure as exc:
+        logger.error("protocol_error: %s", exc)  # spec §5:不降级,直接报错
+        q.put(("error", {"class": "protocol" if exc.kind == "protocol"
+                         else "internal", "message": str(exc)}))
+    except Exception as exc:  # noqa: BLE001 — 未分类异常 fail-closed,不外泄栈
+        logger.error("chat_turn_failed: %s", exc, exc_info=True)
+        q.put(("error", {"class": "internal",
+                         "message": str(exc) or type(exc).__name__}))
+    finally:
+        q.put(_SENTINEL)
+
+
+@app.post("/api/chat/sessions")
+async def chat_create_session(request: Request,
+                              req: ChatSessionCreate | None = None):
+    """新建会话:title 可选,缺省「新会话」。"""
+    title = req.title if req and req.title is not None else "新会话"
+    return await run_sync(request.app.state.chat.sessions.create_session, title)
+
+
+@app.get("/api/chat/sessions")
+async def chat_list_sessions(request: Request):
+    """会话列表(创建顺序,latest rev 生效)。"""
+    return await run_sync(request.app.state.chat.sessions.list_sessions)
+
+
+@app.get("/api/chat/sessions/{sid}")
+async def chat_get_session(sid: str, request: Request):
+    """会话详情:{session, messages},消息动态还原 user_view;未知 404。"""
+    service = request.app.state.chat
+    try:
+        session = await run_sync(service.sessions.get_session, sid)
+        messages = await run_sync(service.sessions.list_messages, sid)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"会话不存在: {sid}")
+    return {"session": session, "messages": messages}
+
+
+@app.post("/api/chat/sessions/{sid}/messages")
+async def chat_send_message(sid: str, req: ChatMessageRequest, request: Request):
+    """发消息(SSE 单流):on_event 经 queue 泵入生成器;限流在开流前拒绝。
+
+    帧格式 `event: stage|token|done|error` + `data: <json>`;done/error 为终帧。
+    空白 text 且无附件 → 400;未知会话 → 404;超限 → 429。
+    """
+    service = request.app.state.chat
+    try:
+        files = [{"filename": f.filename,
+                  "data": base64.b64decode(f.content_b64)}
+                 for f in (req.files or [])]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"附件解码失败: {e}")
+    if (not req.text or not req.text.strip()) and not files:
+        raise HTTPException(status_code=400,
+                            detail="空白输入被拒:text 无内容且无附件")
+    try:
+        await run_sync(service.sessions.get_session, sid)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"会话不存在: {sid}")
+    if _rate_limited(sid):
+        raise HTTPException(status_code=429,
+                            detail="限流:每会话每分钟最多 10 条")
+
+    q: queue.Queue = queue.Queue()
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _run_turn_pump, service, sid, req.text, files, q)
+
+    def _frames():
+        while True:
+            item = q.get()
+            if item is _SENTINEL:        # 兜底收尾(正常以 done/error 终止)
+                return
+            kind, data = item
+            yield _sse_frame(kind, data)
+            if kind in ("done", "error"):   # 终帧
+                return
+
+    return StreamingResponse(_frames(), media_type="text/event-stream")
+
+
+@app.get("/api/messages/{mid}/pipeline")
+async def message_pipeline(mid: str, request: Request):
+    """查看器一次取全:message(含动态 user_view)+ artifacts + verification +
+    chain_entries(按 chain_refs 解析)+ files;未知 404。"""
+    service = request.app.state.chat
+    try:
+        rec = await run_sync(service.sessions.get_message, mid)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"消息不存在: {mid}")
+    entries = service.chain.entries
+    chain_entries = [entries[i] for i in rec.get("chain_refs") or []]
+    return {
+        "message": rec,
+        "artifacts": rec.get("artifacts") or {},
+        "verification": rec.get("verification") or [],
+        "chain_entries": chain_entries,
+        "files": rec.get("files") or [],
+    }
+
+
+@app.get("/api/chain")
+async def chain_state(request: Request):
+    """链状态:entries + verify(缓存)+ root + 全链 Merkle + 条数。"""
+    service = request.app.state.chat
+    entries = service.chain.entries
+    merkle = await run_sync(MerkleTree, [e["hash"] for e in entries])
+    return {
+        "chain": entries,
+        "chain_valid": _chain_valid_cached(service),
+        "chain_root": service.chain.root,
+        "merkle": merkle.to_dict(),
+        "count": len(entries),
+    }
+
+
+@app.get("/api/chain/entry/{index}/proof")
+async def chain_entry_proof(index: int, request: Request):
+    """Merkle 单条证明(全链叶子集建树):{index, leaf, proof, root, verified}。"""
+    entries = request.app.state.chat.chain.entries
+    if index < 0 or index >= len(entries):
+        raise HTTPException(status_code=404, detail=f"链条目不存在: {index}")
+    tree = MerkleTree([e["hash"] for e in entries])
+    proof = tree.proof(index)
+    leaf = entries[index]["hash"]
+    return {"index": index, "leaf": leaf, "proof": proof, "root": tree.root,
+            "verified": tree.verify_proof(leaf, index, proof, tree.root)}
+
+
+@app.post("/api/verify/preimage")
+async def verify_preimage(req: PreimageVerifyRequest):
+    """preimage 独立复算:纯数据返回,服务端不下验证结论(UI 中性表述)。"""
+    recomputed = h_hex(req.preimage)
+    return {"preimage": req.preimage,
+            "expected_hash": req.expected_hash,
+            "recomputed_hash": recomputed,
+            "match": recomputed == req.expected_hash}
+
+
 # 托管前端构建产物（若存在）
-import os
 _FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist")
 if os.path.isdir(_FRONTEND_DIST):
     app.mount("/assets", StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")), name="assets")
