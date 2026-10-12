@@ -76,3 +76,10 @@ body {
   to { transform: translateX(-50%); }
 }
 .chain-scroll { animation: chain-scroll 18s linear infinite; }
+
+/* 验收抽屉跳转定位闪烁(动效白名单:仅定位提示,无数据动画) */
+@keyframes cg-flash {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(67, 97, 238, 0); }
+  30%, 70% { box-shadow: 0 0 0 5px rgba(67, 97, 238, 0.35); }
+}
+.cg-flash { animation: cg-flash 1.2s ease-in-out 1; }
