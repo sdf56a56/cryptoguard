@@ -79,6 +79,54 @@ cd backend && python -m uvicorn app.main:app --reload --port 8000
 cd frontend && npm run dev   # http://localhost:5173（已配置代理到 8000）
 ```
 
+## 对话模式与过程查看器
+
+围绕「对话 → 过程留痕 → 事后审计」的三个页面（前端路由，后端同一套数据）：
+
+| 路由 | 作用 |
+|---|---|
+| `/chat` | 对话模式：发送消息即走「识别 → 脱敏 → 令牌化 → 出站 → 回程验证 → 本地还原」流水线，SSE 单流实时推进（`event: stage/token/done/error` 帧区分阶段、增量与收尾），隐私状态栏常显脱敏/降级状态 |
+| `/inspect/:messageId` | 过程查看器：一条消息的 **user_view（原文视角）/ llm_view（模型视角）** 双视角对照，附流水线产物、验证结果与对应哈希链条目；六种失败态（缺失/损坏/链断/未验证/降级/断流）各有明确呈现 |
+| `/demo` | 演示页 + 验收抽屉：演示沙箱链（与正式链隔离）、Golden Set 实测指标、SEC-STORE-1/REPLAY-1/DEGRADE-1 三条验收用例一键实跑、故障三选一注入按钮 |
+
+### 持久化布局（`data/`）
+
+```
+data/
+├── chain/seg-000001.ndjson     # 哈希链日志（封缄 NDJSON，段轮转）
+├── sessions/seg-000001.ndjson  # 会话日志（封缄 NDJSON）
+├── messages/seg-000001.ndjson  # 消息日志（封缄 NDJSON）
+└── vault_key_fingerprint.txt   # VAULT_KEY 指纹（密钥变更即启动失败）
+```
+
+- 三本日志均为**封缄 NDJSON**（追加 `entry_checksum` 后写入，段轮转 `{name}-{i:06d}.ndjson`），只存 `llm_view` 与加密映射（`session_mapping_ct` / `mapping_delta_ct`），**user_view 明文永不落盘**，读取时动态还原；
+- `vault_key_fingerprint.txt` 是信任根指纹：`VAULT_KEY` 缺失/变更而指纹在 → **拒绝启动**（禁止静默生成）。
+
+### `backend/.env` 密钥
+
+| 键 | 说明 |
+|---|---|
+| `VAULT_KEY` | 64 位十六进制信任根，首次启动自动生成写入 `.env`；派生 mapping/reasoning/chain-mac 子密钥（HKDF） |
+| `MIMO_API_KEY` | MiMo 网关密钥（可选）；**缺失时网关自动回退 Mock**，全链路可离线演示 |
+
+### 运行方式
+
+- 一键：`start.bat`（构建前端 + 启动 uvicorn 8000 + 自动开浏览器；`--rebuild` 强制重建前端）
+- 开发：`cd frontend && npm run dev`（vite 5173）+ `cd backend && py -m uvicorn app.main:app --port 8000`
+
+### 降级语义（三分类，不混用）
+
+| 故障 | 行为 | UI 呈现 |
+|---|---|---|
+| network（网络失败） | 切 Mock 继续应答，`degraded="mock"` | 黄色降级（yellow-degrade） |
+| protocol（协议/契约错） | **直接报错，不降级**，无回复体 | 红色错误（red-error） |
+| stream（流中断） | 保留已收内容，`incomplete=True` | 黄色不完整（yellow-incomplete） |
+
+### 诚实边界
+
+消息记录的 `entry_checksum` **仅用于损坏检测**（意外损坏/截断），**不构成防篡改**；
+防篡改由哈希链（`chain/` 日志 + 启动回放验链 + 双向索引 `message_id ↔ chain_refs`）承担 —— 篡改会被链断检测捕获并拒绝启动（spec §7）。
+
 ## 核心安全机制
 
 ### T1-T4 分级令牌管道(架构)
