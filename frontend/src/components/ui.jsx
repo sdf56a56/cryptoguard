@@ -1,6 +1,30 @@
+import { useState } from 'react'
 import { motion } from 'framer-motion'
 
 // 浅色「加密账本」基础组件
+
+// 一键复制(密码学数据标配:等宽展示 + 复制按钮,UI 零自算)
+export function CopyButton({ value, label = '复制', className = '' }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+      await navigator.clipboard.writeText(text ?? '')
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      setCopied(false)
+    }
+  }
+  return (
+    <button
+      onClick={copy}
+      className={`px-2.5 py-1 rounded-lg border border-line bg-surface text-[11px] text-ink-soft hover:border-vault-300 hover:text-vault-700 shrink-0 ${className}`}
+    >
+      {copied ? '已复制 ✓' : label}
+    </button>
+  )
+}
 
 export function Card({ title, icon, children, className = '', accent = 'vault', right = null }) {
   const borders = {
