@@ -402,3 +402,34 @@ def verify_outbound(req: OutboundRequest, k_t1: bytes, session_salt: bytes,
         violations.append("input_hash 重算不一致")
 
     return violations
+
+
+# ------------------------------------------------------------------ #
+# LLM 配置(设置页):Provider / Base URL / Model / API Key
+# ------------------------------------------------------------------ #
+
+class LLMConfigUpdate(BaseModel):
+    """PUT /api/llm/config 入参。
+
+    api_key 缺省(None)表示「保持已存密钥不变」——前端不回显完整密钥,
+    未改动时不应重新提交;传空串表示显式清空。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    base_url: str
+    model: str
+    display_name: Optional[str] = ""
+    api_key: Optional[str] = None
+
+
+class LLMTestRequest(BaseModel):
+    """POST /api/llm/test 入参:允许用「未保存」的值先测再审。
+
+    三字段均可省略,省略项回落到当前已保存配置;api_key 省略时用已存密钥。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None

@@ -12,13 +12,15 @@ import os
 
 os.environ.setdefault("CG_NO_BOOT", "1")  # 测试不触发 lifespan 装配(个例除外)
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from app import main as main_mod
 from app.bootstrap import build_chat_service
 from app.keys import Vault, VaultKeyError
-from app.llm import LLMGateway, MockChat
+from app.llm import (ConfiguredGateway, LLMGateway, LLMNotConfigured, MockChat,
+                     OpenAIChatLLM)
 from app.store import StoreIntegrityError, entry_checksum
 
 
@@ -168,17 +170,50 @@ def test_replay_across_rotated_segments(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# MIMO_API_KEY 缺失:mimo=None(mock-only,恒降级 degraded="mock")
+# 未配置 API Key:装配 ConfiguredGateway 且 fail-closed(不再静默降级 Mock)
 # --------------------------------------------------------------------------- #
-def test_default_gateway_mock_only_without_api_key(tmp_path, monkeypatch):
+def test_default_gateway_without_api_key_fails_closed(tmp_path, monkeypatch):
     isolate_env(tmp_path, monkeypatch)
     svc = build_chat_service(tmp_path)          # gateway=None → 按环境组装
 
-    assert isinstance(svc._gateway, LLMGateway)
-    assert svc._gateway.mimo is None            # mock-only
-    sid = svc.sessions.create_session("降级")["id"]
+    assert isinstance(svc._gateway, ConfiguredGateway)
+    assert svc._gateway.config_store is svc.llm_config   # 单一配置源
+    assert svc.llm_config.load().api_key == ""           # 无密钥
+
+    sid = svc.sessions.create_session("未配置")["id"]
+    with pytest.raises(LLMNotConfigured):
+        svc.run_turn(sid, "你好")               # 绝不返回 Mock 文本冒充模型
+    assert svc.sessions.list_messages(sid) == []          # 失败轮次不落盘
+
+
+def test_default_gateway_uses_saved_config(tmp_path, monkeypatch):
+    """设置页保存后无需重启:网关每次调用都从同一个 store 读配置。"""
+    isolate_env(tmp_path, monkeypatch)
+    svc = build_chat_service(tmp_path)
+    svc.llm_config.save(provider="deepseek", base_url="https://api.deepseek.com/v1",
+                        model="deepseek-chat", api_key="sk-test-key-123456")
+
+    seen: dict = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("Authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n')
+
+    svc._gateway._client_factory = lambda cfg: OpenAIChatLLM(
+        api_key=cfg.api_key, base_url=cfg.base_url, model=cfg.model,
+        transport=httpx.MockTransport(handler))
+
+    sid = svc.sessions.create_session("已配置")["id"]
     result = svc.run_turn(sid, "你好")
-    assert result["degraded"] == "mock"
+
+    assert seen["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert seen["auth"] == "Bearer sk-test-key-123456"
+    assert seen["body"]["model"] == "deepseek-chat"
+    assert result["degraded"] is None           # 真实模型调用,非降级
+    assert svc.sessions.list_messages(sid)[1]["llm_view"] == "hi"
+
 
 
 # --------------------------------------------------------------------------- #

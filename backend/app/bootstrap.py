@@ -11,8 +11,9 @@
   - SEC-REPLAY 双向索引:每条消息 chain_refs 的 index 必须落在链上且
     条目 message_id == 消息 id;每条带 message_id 的链条目必须被对应消息的
     chain_refs 引用。任一不符 → StoreIntegrityError("chain_break")。
-  - 网关密钥不落盘:MIMO_API_KEY 只从环境/backend/.env 读取;缺失时
-    mimo=None(mock-only,恒降级 degraded="mock")。
+  - LLM 配置(含 API Key)经 LLMConfigStore 加密落盘,密钥由 VAULT_KEY
+    派生的 llm-config/v1 子密钥担任,主密钥不与密文同处存放;未配置密钥时
+    网关 fail-closed 报错,不再回退 Mock 冒充模型回答。
 
 明确不承诺:
   - 不承诺多进程并发启动同一数据目录(单写者模型,同 store.py);
@@ -25,9 +26,11 @@ import os
 from pathlib import Path
 
 from .chat_service import ChatService
+from .crypto.aead import AeadCipher
 from .crypto.hashchain import HashChain
 from .keys import Vault, _load_env_file
-from .llm import LLMGateway, MimoLLM, MockChat
+from .llm import ConfiguredGateway, LLMGateway
+from .llm_config import LLMConfigStore
 from .proxy import guard
 from .sessions import SessionStore
 from .store import (DEFAULT_SEG_MAX_BYTES, DEFAULT_SEG_MAX_ENTRIES,
@@ -43,12 +46,17 @@ def default_data_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "data"
 
 
-def _mimo_api_key() -> str:
-    """读取 MIMO_API_KEY:os.environ 优先,缺省回退 backend/.env;空值视为缺失。"""
-    raw = os.environ.get("MIMO_API_KEY", "").strip()
-    if not raw:
-        raw = _load_env_file(_ENV_PATH_DEFAULT).get("MIMO_API_KEY", "").strip()
-    return raw
+def _backend_env_api_key() -> str:
+    """backend/.env 中的 LLM 密钥回退(兼容既有部署);空值视为未配置。
+
+    os.environ 优先于 .env(见 LLMConfigStore._env_api_key)。
+    """
+    values = _load_env_file(_ENV_PATH_DEFAULT)
+    for name in ("DEEPSEEK_API_KEY", "LLM_API_KEY", "MIMO_API_KEY"):
+        value = values.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _cross_check(sessions: SessionStore, chain: HashChain) -> None:
@@ -86,8 +94,9 @@ def build_chat_service(data_dir: Path, gateway: LLMGateway | None = None, *,
     """装配 ChatService(Vault → 三本封缄日志 → 链回放 → 双向核验 → 组装)。
 
     - VaultKeyError / StoreIntegrityError 原样上抛(启动 fail-fast);
-    - gateway 为 None 时按 MIMO_API_KEY 组装:有钥 MimoLLM 优先,
-      无钥 mimo=None(mock-only,恒降级 degraded="mock");
+    - gateway 为 None 时组装 ConfiguredGateway:每次对话从 LLMConfigStore
+      读当前配置(设置页保存即生效,无需重启);未配置密钥则 fail-closed 报错;
+    - 返回的 ChatService.llm_config 与网关共用同一 store 实例;
     - seg_max_entries / seg_max_bytes 仅供测试触发段轮转,生产走默认值。
     """
     vault = Vault.load_or_init(data_dir)
@@ -105,11 +114,15 @@ def build_chat_service(data_dir: Path, gateway: LLMGateway | None = None, *,
     sessions.list_sessions()             # 载会话日志并逐行验封缄(损坏即启动失败)
     _cross_check(sessions, chain)        # SEC-REPLAY 双向索引核验
 
+    # LLM 配置:密钥用 VAULT_KEY 派生的独立子密钥加密落盘,密文与主密钥分离
+    llm_config = LLMConfigStore(data_dir, AeadCipher(vault.llm_config_key),
+                                env_api_key=_backend_env_api_key())
     if gateway is None:
-        api_key = _mimo_api_key()
-        mimo = MimoLLM(api_key=api_key) if api_key else None
-        if mimo is None:
+        gateway = ConfiguredGateway(llm_config)
+        if not llm_config.load().api_key:
             logger.warning(
-                "MIMO_API_KEY 缺失:网关仅 Mock(mimo=None),恒降级 degraded='mock'")
-        gateway = LLMGateway(mimo=mimo, mock=MockChat())
-    return ChatService(guard, sessions, gateway, chain, chain_log)
+                "未配置大模型 API Key:对话将 fail-closed 报错并指引到「设置」页,"
+                "不再静默降级为 Mock 回答")
+    service = ChatService(guard, sessions, gateway, chain, chain_log)
+    service.llm_config = llm_config      # API 层与网关共用同一配置实例
+    return service

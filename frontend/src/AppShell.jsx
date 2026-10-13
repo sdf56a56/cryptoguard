@@ -1,10 +1,11 @@
 import { NavLink, Outlet } from 'react-router-dom'
 
-// 极简顶栏(spec §4.0):产品标记 + 三入口切换,浅底大留白、单一靛蓝主色
+// 极简顶栏(spec §4.0):产品标记 + 四入口切换,浅底大留白、单一靛蓝主色
 const NAV = [
   { to: '/chat', label: '对话' },
   { to: '/inspect', label: '查看器' },
   { to: '/demo', label: '演示' },
+  { to: '/settings', label: '设置' },
 ]
 
 export default function AppShell() {

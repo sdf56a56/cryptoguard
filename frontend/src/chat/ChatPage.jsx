@@ -18,6 +18,7 @@ export default function ChatPage() {
   const [chainInfo, setChainInfo] = useState(null)
   const [entityCount, setEntityCount] = useState(null)
   const [vaultOk, setVaultOk] = useState(false)
+  const [llmConfig, setLlmConfig] = useState(null)   // 后端当前生效的模型配置(脱敏)
   const progressRef = useRef(null)
 
   const refreshChain = useCallback(() => {
@@ -48,6 +49,10 @@ export default function ChatPage() {
         await api.health()
         if (alive) setVaultOk(true)
       } catch { /* 忽略 */ }
+      try {
+        const c = await api.llmConfig()
+        if (alive) setLlmConfig(c.config || null)
+      } catch { /* 忽略:状态栏退化为未知 */ }
     })()
     return () => {
       alive = false
@@ -127,7 +132,7 @@ export default function ChatPage() {
                   llm_view: p.content,
                   user_view: p.content,
                   reasoning: p.reasoning,
-                  reply_meta: { model: null, incomplete: d.incomplete, degraded: d.degraded },
+                  reply_meta: { model: d.model || null, incomplete: d.incomplete, degraded: d.degraded },
                   verification: d.verification,
                   chain_refs: d.chain_refs,
                   files: [],
@@ -159,18 +164,27 @@ export default function ChatPage() {
     [sid, busy, refreshChain],
   )
 
-  // 通道降级状态:最近一条 assistant 的 reply_meta
+  // 通道降级状态 + 实际应答模型:最近一条 assistant 的 reply_meta
   let degraded = null
+  let answerModel = null
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     if (messages[i].role === 'assistant') {
       degraded = messages[i].reply_meta?.degraded || null
+      answerModel = messages[i].reply_meta?.model || null
       break
     }
   }
 
   return (
     <div>
-      <PrivacyStatusBar entityCount={entityCount} chainInfo={chainInfo} degraded={degraded} vaultOk={vaultOk} />
+      <PrivacyStatusBar
+        entityCount={entityCount}
+        chainInfo={chainInfo}
+        degraded={degraded}
+        vaultOk={vaultOk}
+        llmConfig={llmConfig}
+        answerModel={answerModel}
+      />
 
       <div className="mx-auto flex max-w-[1280px] gap-0 px-0">
         {/* 会话侧栏 */}

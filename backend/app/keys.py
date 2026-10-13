@@ -106,12 +106,19 @@ class Vault:
         chain_mac_key: bytes,
         demo_chain_mac_key: bytes,
         fingerprint: str,
+        llm_config_key: bytes | None = None,
     ) -> None:
         self.mapping_key = mapping_key
         self.reasoning_key = reasoning_key
         self.chain_mac_key = chain_mac_key
         self.demo_chain_mac_key = demo_chain_mac_key
         self.fingerprint = fingerprint
+        #: LLM API Key 落盘加密子密钥。缺省由 chain_mac_key 二次派生，
+        #: 仅供 ctor 直注入的测试夹具使用；生产路径由 load_or_init 用根密钥派生。
+        self.llm_config_key = (
+            llm_config_key if llm_config_key is not None
+            else hkdf_sha256(chain_mac_key, "llm-config/v1")
+        )
 
     @classmethod
     def load_or_init(cls, data_dir: Path, env_path: Path | None = None) -> "Vault":
@@ -169,4 +176,5 @@ class Vault:
             chain_mac_key=hkdf_sha256(key_bytes, "chain-mac/v1"),
             demo_chain_mac_key=hkdf_sha256(key_bytes, "chain-mac/demo/v1"),
             fingerprint=fp,
+            llm_config_key=hkdf_sha256(key_bytes, "llm-config/v1"),
         )

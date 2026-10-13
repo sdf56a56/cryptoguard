@@ -78,6 +78,9 @@ class ChatService:
         self._gateway = gateway
         self._chain = chain          # 单链实例(T11 经 store.replay_chain 重建注入)
         self._chain_log = chain_log  # 链写穿日志(SealedNDJSON)
+        #: 装配时由 bootstrap 注入的 LLM 配置存储;None 表示网关自带配置
+        #: (测试直注入 StubGateway 的场景)。API 层经此读写设置页配置。
+        self.llm_config = None
 
     # ------------------------------------------------------------------ #
     # 只读访问(Task 9/10 API 接线;写入仍经 run_turn)
@@ -253,6 +256,7 @@ class ChatService:
             "chain_refs": [e["index"] for e in entries],
             "incomplete": reply.incomplete,
             "degraded": reply.degraded,
+            "model": reply.model,      # 实际应答模型(供前端状态栏/气泡展示)
             "status": status,
         }
         emit("done", result)

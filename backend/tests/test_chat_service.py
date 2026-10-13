@@ -125,7 +125,9 @@ def test_full_turn_dual_view_and_chain(tmp_path):
 
     # —— 返回形态与状态 ——
     assert set(result) == {"message_id", "assistant_message_id", "verification",
-                           "chain_refs", "incomplete", "degraded", "status"}
+                           "chain_refs", "incomplete", "degraded", "model",
+                           "status"}
+    assert result["model"] == "CryptoGuard-Mock-LLM-v1"   # 实际应答模型透出
     assert result["status"] == "verified"
     assert result["incomplete"] is False
     assert result["degraded"] is None

@@ -54,6 +54,11 @@ export const api = {
     kind === 'degrade'
       ? req('/api/acceptance/degrade', { method: 'POST', body: JSON.stringify({ kind: degradeKind }) })
       : req('/api/acceptance/' + kind),
+  // 大模型配置(设置页):密钥只提交到本项目后端,前端不持有任何密钥常量
+  llmConfig: () => req('/api/llm/config'),
+  saveLLMConfig: (payload) => req('/api/llm/config', { method: 'PUT', body: JSON.stringify(payload) }),
+  clearLLMKey: () => req('/api/llm/config/clear-key', { method: 'POST' }),
+  testLLM: (payload) => req('/api/llm/test', { method: 'POST', body: JSON.stringify(payload || {}) }),
   // SSE 发消息(函数声明提升,实现见下方 sendMessageSSE)
   sendMessageSSE,
 }

@@ -30,14 +30,15 @@ from .crypto.merkle import MerkleTree
 from .files import evidence_bundle
 from .gateway import GatewayReject, aggregate, validate_directive
 from .keys import VaultKeyError
-from .llm import LLMFailure
+from .llm import LLMFailure, LLMNotConfigured, probe_connection
+from .llm_config import PROVIDER_PRESETS, LLMConfigError
 from .proxy import guard
 from .sandbox import ATTACKS, AttackSandbox
 from .schemas import (
     DetectRequest, QueryRequest, SSESearchRequest, HEStatsRequest, PolicyUpdate,
     QueryV2Request, AttackInjectRequest, ComputeRequest,
     ChatSessionCreate, ChatMessageRequest, PreimageVerifyRequest,
-    DegradeRequest,
+    DegradeRequest, LLMConfigUpdate, LLMTestRequest,
 )
 from .store import StoreIntegrityError
 
@@ -352,6 +353,11 @@ def _run_turn_pump(service, session_id: str, text: str, files: list,
 
     try:
         service.run_turn(session_id, text, files, on_event)
+    except LLMNotConfigured as exc:
+        # 未配置密钥:fail-closed 且可操作,绝不回落 Mock 冒充模型回答
+        logger.warning("llm_not_configured: %s", exc)
+        q.put(("error", {"class": "unconfigured", "message": str(exc),
+                         "action": "open_settings"}))
     except LLMFailure as exc:
         logger.error("protocol_error: %s", exc)  # spec §5:不降级,直接报错
         q.put(("error", {"class": "protocol" if exc.kind == "protocol"
@@ -519,6 +525,99 @@ async def acceptance_degrade(req: DegradeRequest):
         return await run_sync(degrade_demo, req.kind)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ------------------------------------------------------------------ #
+# LLM 配置 API(设置页):配置读写 / 清空密钥 / 真实连接测试
+#
+# 安全边界:无鉴权,只应监听本机回环。配置接口与对话网关共用同一
+# LLMConfigStore 实例(装配期挂到 ChatService.llm_config),因此不存在
+# 「设置页测的是 A 配置、聊天用的是 B 配置」的双配置源。
+# ------------------------------------------------------------------ #
+
+def _llm_store(request: Request):
+    """取当前装配的配置存储;未装配(如 CG_NO_BOOT 测试)时 503。"""
+    store = getattr(request.app.state.chat, "llm_config", None)
+    if store is None:
+        raise HTTPException(status_code=503,
+                            detail="LLM 配置未装配(服务未完成启动)")
+    return store
+
+
+@app.get("/api/llm/config")
+async def llm_get_config(request: Request):
+    """当前配置(脱敏):不回显完整 API Key,只给掩码与 has_key/configured。"""
+    store = _llm_store(request)
+    return {
+        "config": await run_sync(lambda: store.load().public_view()),
+        "providers": [
+            {"id": pid, "label": p["label"], "base_url": p["base_url"],
+             "models": p["models"]}
+            for pid, p in PROVIDER_PRESETS.items()
+        ],
+        # 密钥来自环境变量(.env / os.environ)而非设置页落盘 → 提示用户去设置页固化
+        "env_fallback": bool(store.load().api_key and not store.persisted),
+    }
+
+
+@app.put("/api/llm/config")
+async def llm_put_config(req: LLMConfigUpdate, request: Request):
+    """保存配置。api_key=None 保持原密钥;空串显式清空。返回脱敏视图。"""
+    store = _llm_store(request)
+    try:
+        cfg = await run_sync(
+            lambda: store.save(provider=req.provider, base_url=req.base_url,
+                               model=req.model, display_name=req.display_name or "",
+                               api_key=req.api_key))
+    except LLMConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    logger.info("llm_config_saved: provider=%s model=%s key_set=%s",
+                cfg.provider, cfg.model, cfg.has_key)
+    return {"ok": True, "config": cfg.public_view()}
+
+
+@app.post("/api/llm/config/clear-key")
+async def llm_clear_key(request: Request):
+    """清空已存 API Key(保留 provider/base_url/model)。"""
+    store = _llm_store(request)
+    cfg = await run_sync(store.clear_key)
+    logger.info("llm_config_key_cleared")
+    return {"ok": True, "config": cfg.public_view()}
+
+
+@app.post("/api/llm/test")
+async def llm_test(req: LLMTestRequest, request: Request):
+    """真实连接测试:发一次最小 chat/completions,按失败类别返回可操作提示。
+
+    未保存的字段可用请求体覆盖,便于「先测再存」;省略项回落已存配置。
+    绝不以「Key 非空」冒充连接成功。
+    """
+    store = _llm_store(request)
+    current = store.load()
+
+    api_key = req.api_key.strip() if req.api_key else current.api_key
+    base_url = (req.base_url or current.base_url or "").strip()
+    model = (req.model or current.model or "").strip()
+
+    if not api_key:
+        return {"ok": False, "category": "missing_key",
+                "message": "尚未填写 API Key，无法测试连接"}
+    if not base_url:
+        return {"ok": False, "category": "missing_base_url",
+                "message": "尚未填写 Base URL，无法测试连接"}
+    if not model:
+        return {"ok": False, "category": "missing_model",
+                "message": "尚未选择 Model，无法测试连接"}
+
+    try:
+        result = await run_sync(probe_connection, api_key, base_url, model)
+    except Exception as exc:  # noqa: BLE001 — 探测自身异常不外泄栈
+        logger.error("llm_probe_failed: %s", exc, exc_info=True)
+        return {"ok": False, "category": "internal",
+                "message": f"测试过程发生内部错误：{type(exc).__name__}"}
+    logger.info("llm_probe: ok=%s category=%s model=%s",
+                result.get("ok"), result.get("category"), model)
+    return result
 
 
 # 托管前端构建产物（若存在）
