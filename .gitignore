@@ -7,6 +7,9 @@ dist/
 *.egg-info/
 .env
 data/
+# 客户端密钥落盘文件(CG_BOOTSTRAP_KEY_FILE),明文凭据,勿入库
+bootstrap.key
+*.key
 
 # 虚拟环境(可由 requirements.txt 重建,勿入库)
 .venv/

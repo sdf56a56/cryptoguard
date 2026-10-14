@@ -26,7 +26,12 @@ class AeadCipher:
 
     def __init__(self, key: bytes | None = None):
         # 主密钥：256-bit。真实部署应来自 KMS / 硬件密钥，本演示在本地随机生成。
-        self._key = key or os.urandom(32)
+        #
+        # 注意这里的 None 与 b"" 语义不同：只有**显式不传**（None，演示/临时会话密钥）
+        # 才随机生成；传入空字节串说明调用方以为自己在用一把真实密钥，此时必须立刻
+        # 报错而不是悄悄换一把随机钥 —— 否则今天加密的数据明天再也解不开，且现场
+        # 没有任何错误信号（fail-closed）。
+        self._key = os.urandom(32) if key is None else key
         self._aead = AESGCM(self._key)
 
     @property

@@ -15,6 +15,9 @@
   - 同理不承诺检测尾段删除(截断):链尾写入权持有者可截断历史。
   - 不承诺多进程并发追加同一存储(单写者模型);不承诺崩溃撕裂写的自动恢复
     (撕裂行按 corrupt 拒绝,fail-closed)。
+  - **不承诺单进程内多线程安全**:本类读写不做互斥,调用方须自行串行化
+    (例如 `middleware/audit.py::AuditStore` 自带 `threading.Lock`);
+    否则读侧可能读到另一个线程正在写的半截行,被误判为 corrupt。
 
 归约:entry_checksum 归约到 HMAC-SHA256 的 EUF-CMA;链回放归约到 SHA-256
 抗第二原像性(同 hashchain.py)。
@@ -82,6 +85,7 @@ class SealedNDJSON:
         self._seg_max_bytes = seg_max_bytes
         self._seg_re = re.compile(re.escape(name) + r"-(\d{6})\.ndjson")
         self._tail: tuple[Path, int, int] | None = None  # 当前段(路径,行数,字节数)
+        self._tail_terminated = True       # 当前段是否以换行结尾(见 _tail_state)
 
     # ------------------------------------------------------------------ #
     # 段清单
@@ -114,6 +118,10 @@ class SealedNDJSON:
             if segs:
                 raw = segs[-1][1].read_bytes()
                 self._tail = (segs[-1][1], raw.count(b"\n"), len(raw))
+                # 崩溃/异常退出的残留:末段最后一行可能没写完(无换行)。
+                # 记录该状态,append 时补一个换行,避免**下一条正常记录**被接到
+                # 半截行后面而一起变成坏行(那会让一次意外退出连带毁掉后续审计)。
+                self._tail_terminated = raw.endswith(b"\n") or not raw
             else:
                 self._tail = (self._seg_path(1), 0, 0)
         return self._tail
@@ -127,6 +135,11 @@ class SealedNDJSON:
         sealed["entry_checksum"] = entry_checksum(self._mac_key, sealed)
         data = (json.dumps(sealed, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
         path, n_lines, n_bytes = self._tail_state()
+        if not self._tail_terminated:
+            # 半截行本身仍会被读取侧判为 corrupt(fail-closed,不掩饰);
+            # 这里只保证新写的记录落在自己的行上,不被半截行吞掉。
+            data = b"\n" + data
+            n_lines += 1                      # 半截行至此才真正成为一行
         if n_lines >= self._seg_max_entries or n_bytes >= self._seg_max_bytes:
             segs = self._segments()
             path = self._seg_path(segs[-1][0] + 1 if segs else 1)
@@ -135,6 +148,7 @@ class SealedNDJSON:
         with path.open("ab") as f:
             f.write(data)
         self._tail = (path, n_lines + 1, n_bytes + len(data))
+        self._tail_terminated = True
         return sealed
 
     def _read_rows(self) -> list[tuple[dict, str, int]]:

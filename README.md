@@ -40,6 +40,12 @@ cryptoguard/
 │   │       ├── sse.py          # SSE 密文索引（真 PRF 方案）
 │   │       ├── he.py           # Paillier 同态加密（真·纯数学）
 │   │       └── zkp.py          # Schnorr ZKP（真·离散对数）
+│   │   └── middleware/     # LLM 安全中间件：Agent ↔ 模型服务商之间的保护网关
+│   │       ├── routes.py       # /v1/chat/completions、/v1/verify、/admin/*
+│   │       ├── pipeline.py     # 出站保护 → 上游 → 回程受控还原 + 响应侧检测 + 审计
+│   │       ├── protection.py   # 占位符(A) / 令牌(B) / 加密令牌(C) 与请求级映射金库
+│   │       ├── confirmations.py# 高风险数据的人工确认与一次性释放
+│   │       └── audit.py        # 封缄审计日志 + 哈希链 + checkpoint 锚点
 │   └── requirements.txt
 ├── frontend/               # React + Vite + Tailwind + ECharts + Framer Motion
 │   └── src/pages/          # 10 个页面
@@ -126,6 +132,31 @@ data/
 
 消息记录的 `entry_checksum` **仅用于损坏检测**（意外损坏/截断），**不构成防篡改**；
 防篡改由哈希链（`chain/` 日志 + 启动回放验链 + 双向索引 `message_id ↔ chain_refs`）承担 —— 篡改会被链断检测捕获并拒绝启动（spec §7）。
+
+## LLM 安全中间件（Agent ↔ 模型服务商）
+
+除演示平台外，后端还带一层**真实网关**：Agent（Codex / Claude Code 等）把请求发给它，
+它识别敏感数据、按策略替换后再发给模型服务商，回程只还原策略允许的部分。
+
+- **三种保护模式**：A 占位符 `[PHONE_001]` / B 令牌 `[CG_TOKEN_…]` / C 加密令牌 `[CG_ENC_v1_…]`（映射以 AES-256-GCM 封缄）
+- **上游永远拿不到明文**：令牌不可预测，且只对签发它的那次请求有效（请求级映射隔离 + TTL/LRU）
+- **高风险数据默认扣留**，只有在「认证客户端申请 + 管理员审批 + 一次性凭据」后才释放明文
+- **可审计但不可反查**：每次调用一条不含明文的审计记录（封缄 + 记录 MAC + 哈希链），`POST /v1/verify` 供客户端自查
+- **流式安全**：令牌跨 SSE 块重组、UTF-8 不被撕断、有界缓冲、断流如实标注
+
+```bash
+cd backend
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8100   # 首次启动会生成客户端密钥
+python -m pytest tests/mw -q                                   # 中间件测试（离线，无外网）
+```
+
+- 架构与配置：[`docs/MIDDLEWARE.md`](docs/MIDDLEWARE.md)
+- 测试与证据：[`docs/MIDDLEWARE_TESTS.md`](docs/MIDDLEWARE_TESTS.md)
+- 配置示例：[`backend/.env.example`](backend/.env.example)
+
+> 诚实边界：哈希/HMAC/哈希链只证明「本地网关写下的内容未被改动」，不证明响应来自某个
+> 服务商；持 `VAULT_KEY` 者可整链重写，检测它需要站外锚点。自动化测试**从不**访问真实
+> 模型服务商，因此不得把测试结果表述为「已在真实厂商上验证」，也不得表述为「系统绝对安全」。
 
 ## 核心安全机制
 

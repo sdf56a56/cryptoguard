@@ -32,6 +32,9 @@ from .gateway import GatewayReject, aggregate, validate_directive
 from .keys import VaultKeyError
 from .llm import LLMFailure, LLMNotConfigured, probe_connection
 from .llm_config import PROVIDER_PRESETS, LLMConfigError
+from .middleware import routes as middleware_routes
+from .middleware.deps import build_middleware
+from .middleware.errors import MiddlewareError
 from .proxy import guard
 from .sandbox import ATTACKS, AttackSandbox
 from .schemas import (
@@ -51,17 +54,46 @@ async def _lifespan(app_: FastAPI):
 
     VaultKeyError/StoreIntegrityError → logger.critical + 终止启动(fail-fast,
     不带病服务);CG_NO_BOOT=1 时跳过装配(测试直挂 app.state.chat)。
+    随后装配 LLM API 安全中间件(见 _boot_middleware)。
     """
     if os.environ.get("CG_NO_BOOT") == "1":
         yield
         return
     try:
-        app_.state.chat = build_chat_service(default_data_dir())
+        data_dir = default_data_dir()
+        app_.state.chat = build_chat_service(data_dir)
     except (VaultKeyError, StoreIntegrityError):
         logger.critical("启动失败:信任根/存储回放校验未通过,拒绝带病服务",
                         exc_info=True)
         raise
+    _boot_middleware(app_, data_dir)
     yield
+    _shutdown_middleware(app_)
+
+
+def _shutdown_middleware(app_: FastAPI) -> None:
+    """退出时释放上游连接池(中间件未装配时静默跳过)。"""
+    middleware = getattr(app_.state, "middleware", None)
+    if middleware is not None:
+        middleware.registry.close()
+
+
+def _boot_middleware(app_: FastAPI, data_dir) -> None:
+    """装配 LLM API 安全中间件(与演示平台共用同一信任根与 data/ 目录)。
+
+    装配失败时:生产环境直接失败(不带病提供安全网关);开发环境只记 critical,
+    /health 与 /v1/* 返回 503 并说明原因,既有 /api/* 演示功能不受影响。
+    """
+    try:
+        app_.state.middleware = build_middleware(data_dir)
+    except MiddlewareError as exc:
+        if os.environ.get("CG_ENV", "").strip().lower() == "production":
+            logger.critical("中间件装配失败,生产环境拒绝启动: %s", exc.detail,
+                            exc_info=True)
+            raise
+        logger.critical(
+            "中间件装配失败,/v1/* 与 /admin/* 将返回 503(既有 /api/* 不受影响):"
+            " %s。修复 CG_* 配置后重启即可。", exc.detail)
 
 
 app = FastAPI(title="CryptoGuard", version="1.0.0", lifespan=_lifespan)
@@ -75,6 +107,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# LLM API 安全中间件:/health、/v1/*、/admin/*(与既有 /api/* 并存)
+middleware_routes.install(app)
 
 
 @app.get("/api/health")
