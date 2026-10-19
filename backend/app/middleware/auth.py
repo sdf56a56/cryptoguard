@@ -93,6 +93,12 @@ class ClientKey:
     #: 空 = 跟随全局策略
     protection_mode: str = ""
     restore_categories: list[str] = field(default_factory=list)
+    #: 过期时间(epoch 秒);0 = 永不过期。新增字段对旧记录默认 0,保持兼容。
+    expires_epoch: float = 0.0
+
+    @property
+    def expired(self) -> bool:
+        return bool(self.expires_epoch) and time.time() >= self.expires_epoch
 
     def public_view(self) -> dict:
         """对外视图:绝不包含 key_hash 与明文密钥。"""
@@ -107,6 +113,7 @@ class ClientKey:
             "rate_limit_per_min": self.rate_limit_per_min,
             "protection_mode": self.protection_mode,
             "restore_categories": list(self.restore_categories),
+            "expires_epoch": self.expires_epoch,
         }
 
 
@@ -165,6 +172,7 @@ class ClientKeyStore:
                         rate_limit_per_min=int(rec.get("rate_limit_per_min") or 0),
                         protection_mode=str(rec.get("protection_mode") or ""),
                         restore_categories=list(rec.get("restore_categories") or []),
+                        expires_epoch=float(rec.get("expires_epoch") or 0.0),
                     )
             self._cache = latest
             return latest
@@ -186,6 +194,7 @@ class ClientKeyStore:
                 "rate_limit_per_min": merged.rate_limit_per_min,
                 "protection_mode": merged.protection_mode,
                 "restore_categories": merged.restore_categories,
+                "expires_epoch": merged.expires_epoch,
             })
             self._cache = None
         return merged
@@ -205,9 +214,12 @@ class ClientKeyStore:
 
     def create(self, name: str, *, models: list[str] | None = None,
                rate_limit_per_min: int = 0, protection_mode: str = "",
-               restore_categories: list[str] | None = None) -> tuple[ClientKey, str]:
+               restore_categories: list[str] | None = None,
+               expires_in_days: int = 0) -> tuple[ClientKey, str]:
         """创建客户端密钥;返回 (记录, 明文密钥)。明文只此一次。"""
         plaintext, prefix, secret = generate_client_key()
+        expires_epoch = (time.time() + int(expires_in_days) * 86400.0
+                         if int(expires_in_days or 0) > 0 else 0.0)
         record = {
             "type": "client",
             "id": uuid.uuid4().hex,
@@ -222,6 +234,7 @@ class ClientKeyStore:
             "rate_limit_per_min": int(rate_limit_per_min or 0),
             "protection_mode": protection_mode or "",
             "restore_categories": list(restore_categories or []),
+            "expires_epoch": expires_epoch,
         }
         with self._lock:
             self._log.append(record)
@@ -242,6 +255,16 @@ class ClientKeyStore:
             key, prefix=prefix, key_hash=key_digest(self._pepper, prefix, secret),
             revoked=False)
         return updated, plaintext
+
+    def update(self, client_id: str, **changes) -> ClientKey:
+        """更新客户端配置（PATCH）；只接受显式列出的字段，rev 递增。"""
+        key = self.get(client_id)
+        allowed = {"name", "models", "rate_limit_per_min", "protection_mode",
+                   "restore_categories", "expires_epoch"}
+        clean = {field: value for field, value in changes.items() if field in allowed}
+        if not clean:
+            return key
+        return self._append_revision(key, **clean)
 
     def touch(self, client_id: str) -> None:
         """记录最近使用时间(不递增权限相关字段;失败静默,不影响请求)。
@@ -278,6 +301,8 @@ class ClientKeyStore:
             raise MiddlewareError("auth", "客户端密钥无效")
         if match.revoked:
             raise MiddlewareError("auth", "客户端密钥已被撤销")
+        if match.expired:
+            raise MiddlewareError("auth", "客户端密钥已过期,请向管理员申请新密钥")
         return match
 
 
@@ -285,32 +310,45 @@ class ClientKeyStore:
 # 管理员认证
 # --------------------------------------------------------------------------- #
 class AdminAuthenticator:
-    """管理员接口认证:静态令牌(CG_ADMIN_TOKEN)+ 常数时间比较。
+    """管理员接口认证:全权令牌 + 可选只读令牌,常数时间比较。
 
-    未配置令牌时:开发环境返回明确 503(提示如何配置),生产环境启动期已 fail-fast
-    (config._enforce_production),不会走到这里。
+    - 未配置任何令牌:开发环境返回明确 503,生产环境启动期已 fail-fast;
+    - 只读令牌只能调用 `write=False` 的接口(GET 类查询、/metrics、审计校验);
+    - 写操作持只读令牌一律 403,不靠“有没有这个接口”来兜底。
     """
 
-    def __init__(self, token: str, *, production: bool = False):
+    def __init__(self, token: str, *, production: bool = False,
+                 readonly_token: str = ""):
         self._token = (token or "").strip()
+        self._readonly = (readonly_token or "").strip()
         self._production = production
 
     @property
     def configured(self) -> bool:
         return bool(self._token)
 
-    def require(self, presented: str | None) -> None:
-        if not self._token:
+    @property
+    def readonly_configured(self) -> bool:
+        return bool(self._readonly)
+
+    def require(self, presented: str | None, *, write: bool = True) -> str:
+        """校验管理员凭证;返回 "admin" 或 "readonly"。"""
+        presented = str(presented or "").strip()
+        if not self._token and not self._readonly:
             raise MiddlewareError(
                 "config",
                 "管理员接口未启用:请设置 CG_ADMIN_TOKEN 后重启"
                 "(开发环境也需显式配置,避免无凭证的管理面)")
         if not presented:
             raise MiddlewareError("auth", "缺少管理员令牌(X-Admin-Token)")
-        if not hmac.compare_digest(str(presented).strip(), self._token):
-            logger.warning("admin_auth_failed: 令牌不匹配")
-            raise MiddlewareError("auth", "管理员令牌无效")
-
+        if self._token and hmac.compare_digest(presented, self._token):
+            return "admin"
+        if self._readonly and hmac.compare_digest(presented, self._readonly):
+            if write:
+                raise MiddlewareError("forbidden", "只读管理员令牌不能执行写操作")
+            return "readonly"
+        logger.warning("admin_auth_failed: 令牌不匹配")
+        raise MiddlewareError("auth", "管理员令牌无效")
 
 def now_epoch() -> float:
     """便于测试注入的当前时间(秒)。"""

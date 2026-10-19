@@ -227,6 +227,9 @@ class ChatCompletionRequest(BaseModel):
     seed: int | None = None
     user: str | None = Field(default=None, max_length=200)
     response_format: ResponseFormatIn | None = None
+    #: 新参数显式建模并透传给 openai-compatible 上游；anthropic 上游会显式拒绝
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    verbosity: Literal["low", "medium", "high"] | None = None
     cryptoguard: CryptoGuardDirectiveIn | None = None
 
     # -- 以下字段显式建模只为给出明确错误(绝不静默忽略) ------------------ #
@@ -328,6 +331,10 @@ class ChatCompletionRequest(BaseModel):
             if self.response_format.json_schema is not None:
                 fmt["json_schema"] = self.response_format.json_schema
             extra["response_format"] = fmt
+        if self.reasoning_effort is not None:
+            extra["reasoning_effort"] = self.reasoning_effort
+        if self.verbosity is not None:
+            extra["verbosity"] = self.verbosity
         return extra
 
     def effective_max_tokens(self) -> int | None:
@@ -393,13 +400,16 @@ class AnthropicMessagesRequest(BaseModel):
     container: Any = None
     mcp_servers: Any = None
 
-    def check_supported(self) -> list[str]:
+    def check_supported(self, settings=None) -> list[str]:
         ignored: list[str] = []
         if self.thinking:
-            raise MiddlewareError(
-                "invalid_request",
-                "thinking(扩展思考)当前不支持:无法保证思考块在跨协议转换中的语义与"
-                "敏感数据保护一致,拒绝静默降级为普通回答")
+            mode = getattr(settings, "anthropic_thinking", "strip") if settings else "strip"
+            if mode == "reject":
+                raise MiddlewareError(
+                    "invalid_request",
+                    "thinking(扩展思考)当前被策略拒绝(CG_ANTHROPIC_THINKING=reject):"
+                    "思考块可能回显令牌,且跨协议转换无法保证语义等价")
+            ignored.append("thinking")
         if self.top_k is not None:
             raise MiddlewareError(
                 "invalid_request",

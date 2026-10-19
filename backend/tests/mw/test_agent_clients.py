@@ -469,24 +469,21 @@ def test_agent_upstream_error_is_mapped_and_leaks_nothing(agent_env):
 # --------------------------------------------------------------------------- #
 # 5. 明确的缺口(不假装成功)
 # --------------------------------------------------------------------------- #
-def test_codex_responses_api_is_not_implemented_and_fails_loudly(agent_env):
-    """当前 Codex CLI 只讲 Responses API;本仓库未实现它。
-
-    这个用例的作用不是「测通过」,而是把缺口**钉成可执行的事实**:
-    客户端拿到的是显式的 JSON 404(附带已实现端点清单),而不是挂起或伪装成功。
-    若将来实现了 `/v1/responses`,本用例会失败 —— 那时应当连同真实 Codex 联调一起更新。
-    """
+def test_codex_responses_api_is_implemented_and_protects_upstream(agent_env):
+    """Codex 只讲 Responses API：本仓库提供无状态最小子集，且上游只看到令牌。"""
     _, client, auth, upstream = agent_env(subdir="agent-codex")
 
     response = client.post("/v1/responses", headers=auth, json={
         "model": "mock-chat",
         "input": [{"role": "user", "content": PHONE}],
     })
-    assert response.status_code == 404, response.text
+    assert response.status_code == 200, response.text
     body = response.json()
-    assert body["error"]["code"] == "not_found"
-    assert "/v1/chat/completions" in body["error"]["message"]
-    assert upstream.requests == []
+    assert body["object"] == "response"
+    assert body["output"][0]["type"] == "message"
+    assert len(upstream.requests) == 1, "Responses 请求应当被转发到上游一次"
+    raw = upstream.requests[-1]["body"].decode("utf-8")
+    assert PHONE not in raw
 
 
 def test_count_tokens_endpoint_is_not_implemented(agent_env):

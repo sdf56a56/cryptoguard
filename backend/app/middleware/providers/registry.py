@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 
 import httpx
 
@@ -147,19 +146,15 @@ class ProviderRegistry:
 
 
 def build_registry(settings, *, transports: dict[str, httpx.BaseTransport] | None = None,
-                   extra_providers: dict[str, ModelProvider] | None = None,
-                   key_resolvers: dict[str, "Callable[[], str]"] | None = None) -> ProviderRegistry:
+                   extra_providers: dict[str, ModelProvider] | None = None) -> ProviderRegistry:
     """按 Settings 装配注册表。
 
-    - key_source=env:启动期经 ProviderSettings.api_key() 从环境变量读取;
-    - key_source=llm-config:经 key_resolvers 注入的解析器每次调用重读(复用既有
-      平台的加密 LLM 配置);
-    - 两种来源在密钥缺失时都**不阻断装配**(便于先起服务再补密钥),
-      但调用时由 ModelProvider.ensure_configured() fail-closed 报 config 错误,绝不出网;
-    - transports 仅供测试注入 httpx.MockTransport,生产路径不传。
+    - 密钥在启动期经 ProviderSettings.api_key() 从环境变量读取，只存在于内存；
+    - 密钥缺失**不阻断装配**（便于先起服务再补密钥），但调用时由
+      ModelProvider.ensure_configured() fail-closed 报 config 错误，绝不出网；
+    - transports 仅供测试注入 httpx.MockTransport，生产路径不传。
     """
     transports = transports or {}
-    resolvers = key_resolvers or {}
     providers: dict[str, ModelProvider] = {}
     for p in settings.providers:
         impl = _PROVIDER_TYPES.get(p.type)
@@ -169,10 +164,8 @@ def build_registry(settings, *, transports: dict[str, httpx.BaseTransport] | Non
             name=p.name,
             type=p.type,
             base_url=p.base_url,
-            api_key=p.api_key() if p.key_source == "env" else "",
+            api_key=p.api_key(),
             api_key_env=p.api_key_env,
-            key_source=p.key_source,
-            api_key_resolver=resolvers.get(p.name),
             models=tuple(p.models),
             display_name=p.display_name or p.name,
             timeout_connect=p.timeout_connect,
@@ -183,17 +176,11 @@ def build_registry(settings, *, transports: dict[str, httpx.BaseTransport] | Non
             stream_options=p.stream_options,
             token_limit_field=p.token_limit_field,
         )
-        if p.key_source == "llm-config" and p.name not in resolvers:
-            raise MiddlewareError(
-                "config",
-                f"提供商 {p.name!r} 声明 key_source=llm-config,但装配期未注入密钥解析器")
         kwargs = {"transport": transports[p.name]} if p.name in transports else {}
         providers[p.name] = impl(config, **kwargs)
         if not config.configured:
-            logger.warning("提供商 %s 未配置完整(%s):调用该提供商会 fail-closed 报错",
-                           p.name,
-                           f"环境变量 {p.api_key_env} 为空" if p.key_source == "env"
-                           else "既有平台 LLM 配置中尚无密钥")
+            logger.warning("提供商 %s 未配置完整(环境变量 %s 为空):"
+                           "调用该提供商会 fail-closed 报错", p.name, p.api_key_env)
     for name, provider in (extra_providers or {}).items():
         providers[name] = provider
     return ProviderRegistry(

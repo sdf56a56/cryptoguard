@@ -31,7 +31,6 @@ import re
 from pathlib import Path
 
 from .canon import canon
-from .crypto.hashchain import HashChain
 
 DEFAULT_SEG_MAX_ENTRIES = 5000
 DEFAULT_SEG_MAX_BYTES = 10 * 1024 * 1024  # 10MB
@@ -183,35 +182,3 @@ class SealedNDJSON:
     def read_all(self) -> list[dict]:
         """按段序返回全部封缄对象(含 entry_checksum),逐行验校验,往返一致。"""
         return [obj for obj, _, _ in self._read_rows()]
-
-
-def replay_chain(store: SealedNDJSON) -> HashChain:
-    """启动链回放:逐行验 checksum → 重建 HashChain → 逐条验 prev_hash→hash 链接。
-
-    重建走 HashChain.append 公开接口逐条重放(自动沿用 mid 前映像规则),重算的
-    index/prev_hash/hash 与存储条目逐一比对;任何不符(含链条目字段缺失)抛
-    StoreIntegrityError(kind="chain_break"),消息含段名、行号与条目 index。
-    checksum/JSON 失配由读取侧抛 kind="corrupt"。返回的链 _prev/entries 已恢复,
-    可继续 append。
-    """
-    chain = HashChain()
-    for obj, seg_name, line_no in store._read_rows():
-        index = obj.get("index")
-        try:
-            entry = chain.append(
-                obj["entry_type"], obj["payload_digest"], obj["timestamp"],
-                obj.get("message_id"),
-            )
-        except (KeyError, TypeError):
-            raise StoreIntegrityError(
-                "chain_break",
-                f"{seg_name} 第 {line_no} 行链条目字段缺失,链无法重建(index={index})",
-            ) from None
-        if (entry["index"] != index or entry["prev_hash"] != obj.get("prev_hash")
-                or entry["hash"] != obj.get("hash")):
-            raise StoreIntegrityError(
-                "chain_break",
-                f"{seg_name} 第 {line_no} 行链接断裂(index={entry['index']}):"
-                "重算 prev_hash/hash 与存储不符",
-            )
-    return chain

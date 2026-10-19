@@ -1,0 +1,20 @@
+[project]
+name = "cryptoguard"
+version = "2.0.0"
+description = "LLM API 安全中转网关（单进程）：出站保护、回程受控还原、可验证审计"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "canonicaljson>=2.0.0",
+    "cryptography>=43.0.1",
+    "fastapi>=0.115.0",
+    "httpx>=0.27.2",
+    "pydantic>=2.9.2",
+    "pytest>=8.3.3",
+    "rfc8785>=0.1.4",
+    "uvicorn[standard]>=0.30.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
