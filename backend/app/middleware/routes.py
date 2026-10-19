@@ -1,14 +1,17 @@
 """
 HTTP 入口 —— /health、/v1/*、/admin/*
 
-挂载方式(见 app/main.py):`middleware.routes.install(app)`,
-与既有 `/api/*`(敏感数据加密演示平台)并存,互不影响。
+挂载方式(见 app/main.py):`middleware.routes.install(app)`。
+演示平台已删除；本文件是后端唯一 HTTP 入口（`/v1/*`、`/admin/*`、健康/就绪/指标）。
 
 端点:
   GET  /health                     健康与策略摘要(无需认证,不含任何密钥)
   GET  /v1/models                  OpenAI 兼容模型列表(需客户端认证,除非显式允许匿名)
   POST /v1/chat/completions        OpenAI 兼容补全(非流式/流式)
   POST /v1/messages                Anthropic Messages 入口(Claude Code 等原生客户端)
+  POST /v1/responses               OpenAI Responses 入口(Codex 无状态子集)
+  GET  /ready                      就绪检查
+  GET  /metrics                    Prometheus 文本指标(默认需管理员令牌)
   POST /v1/verify                  校验一次请求的处理记录与摘要(本人或管理员)
   GET  /admin/security/policies    生效策略视图(管理员)
   GET  /admin/audit                审计分页(管理员)
@@ -19,6 +22,9 @@ HTTP 入口 —— /health、/v1/*、/admin/*
   POST /admin/clients              签发客户端密钥(管理员;明文只回一次)
   POST /admin/clients/{id}/revoke  撤销(管理员)
   POST /admin/clients/{id}/rotate  轮换(管理员;明文只回一次)
+  PATCH /admin/clients/{id}        更新客户端配置(管理员)
+  GET  /admin/providers            提供商视图(管理员/只读管理员)
+  POST /admin/providers/{name}/test 上游连通性测试(管理员)
 
 安全约束(实现即按此执行):
   - 鉴权先于限流,限流先于上游调用:未认证请求不可能消耗上游额度
@@ -646,8 +652,11 @@ async def _run_sync(app: MiddlewareApp, ctx: RequestContext, neutral,
                      anthropic=(protocol == "anthropic"), ctx=ctx, app=app)
     _touch_client(app, client)
     if idem is not None and app.idempotency is not None:
-        app.idempotency.put(idem[0], idem[1], payload, status=200,
-                            headers=headers, request_id=ctx.request_id)
+        try:
+            app.idempotency.put(idem[0], idem[1], payload, status=200,
+                                headers=headers, request_id=ctx.request_id)
+        except Exception:  # noqa: BLE001 — 幂等缓存失败不能把成功响应变成 500
+            logger.warning("idempotency_cache_failed", exc_info=True)
     return JSONResponse(content=payload, headers=headers)
 
 

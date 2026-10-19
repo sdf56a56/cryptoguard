@@ -59,8 +59,9 @@ def _content_parts(content: Any) -> list[dict]:
                 raise _bad("input_image 缺少 image_url")
             parts.append({"type": "image_url", "image_url": {"url": url}})
         elif btype in ("input_file", "input_audio"):
-            # 内容面策略会按 document/音频规则拒绝；这里先保留结构让策略统一判定
-            parts.append({"type": btype, "raw": block})
+            # 内容面策略已在入口按 document/音频规则拒绝或登记；
+            # 这里丢弃无法等价转发的结构，绝不把原始分块塞进 OpenAI payload。
+            continue
         else:
             raise _bad(f"Responses content 分块类型 {btype!r} 不受支持")
     return parts or [{"type": "text", "text": ""}]

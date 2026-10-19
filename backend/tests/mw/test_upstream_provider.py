@@ -794,7 +794,7 @@ def test_registry_forwards_trust_env(tmp_path, monkeypatch):
                          "真实厂商联调请显式设置 CG_REAL_UPSTREAM_KEY / "
                          "CG_REAL_UPSTREAM_URL / CG_REAL_MODEL 后运行 "
                          "tests/mw/test_real_http_e2e.py::test_real_vendor_upstream_opt_in,"
-                         "边界与注意事项见 docs/MIDDLEWARE_TESTS.md")
+                         "边界与注意事项见 docs/GATEWAY_TESTS.md")
 def test_real_upstream_not_executed():
     """占位:真实厂商(DeepSeek/OpenAI)连通性测试。
 

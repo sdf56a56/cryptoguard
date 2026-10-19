@@ -82,6 +82,7 @@ class MiddlewareApp:
                 "client_keys": self.clients.count(),
                 "anonymous_allowed": self.settings.allow_anonymous,
                 "admin_configured": self.admin.configured,
+                "readonly_admin_configured": self.admin.readonly_configured,
             },
             "audit": audit_view,
             "vault": self.token_vault.stats(),
@@ -216,8 +217,7 @@ def _startup_warnings(settings: Settings, registry: ProviderRegistry) -> list[st
             "CG_ALLOW_ANONYMOUS=1:未认证请求会消耗上游额度,仅限本机调试使用")
     for view in _provider_views(settings, registry):
         if view["type"] != "mock" and not view["has_key"]:
-            source = (f"环境变量 {view['key_env']}" if view["key_source"] == "env"
-                      else "既有平台 LLM 配置")
+            source = f"环境变量 {view.get('key_env') or '<未指定 api_key_env>'}"
             warnings.append(
                 f"提供商 {view['name']} 未配置密钥({source}):"
                 "调用该提供商会 fail-closed 报错")
@@ -240,4 +240,14 @@ def _startup_warnings(settings: Settings, registry: ProviderRegistry) -> list[st
             "(安全失败,但建议让确认有效期不超过金库 TTL)")
     if settings.detection_config_path:
         warnings.append(f"已加载自定义检测规则: {settings.detection_config_path}")
+    if settings.image_policy == "pass":
+        warnings.append("CG_IMAGE_POLICY=pass:图片内容不经过检测,属于显式接受的未保护面")
+    if settings.document_policy == "pass":
+        warnings.append("CG_DOCUMENT_POLICY=pass:文档内容不经过检测,属于显式接受的未保护面")
+    if settings.metrics_public:
+        warnings.append("CG_METRICS_PUBLIC=1:/metrics 可匿名访问,仅限受信网络")
+    if settings.admin_readonly_token:
+        warnings.append("已启用只读管理员令牌:GET/指标/审计校验可用,写操作仍要求全权令牌")
+    if not settings.instance_lock:
+        warnings.append("CG_INSTANCE_LOCK=0:已关闭单实例锁,确认/金库/限流/审计不再有进程互斥")
     return warnings

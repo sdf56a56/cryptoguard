@@ -222,23 +222,39 @@ def chain_hash_of(prev_hash: str, seq: int, request_id: str,
     })
 
 
+def _mac_payload(record: RequestRecord, fields: set[str] | None = None) -> dict:
+    """MAC 前映像：记录字段（剔除 record_mac），可按落盘实际字段裁剪。
+
+    为什么要裁剪：给 RequestRecord 增加带默认值的新字段时，旧记录的前映像里
+    并没有这些键；若重算时把默认值补进去，历史记录会突然“MAC 校验失败”。
+    裁剪后新旧记录都能用同一套逻辑验证。
+    """
+    data = record.to_dict()
+    data.pop("record_mac", None)
+    if fields is not None:
+        data = {key: value for key, value in data.items() if key in fields}
+    return data
+
+
 def record_mac(key: bytes, record: RequestRecord) -> str:
     """记录级 HMAC(HMAC-SHA256 over JCS 规范化记录)。"""
-    return hmac.new(key, canon(record.payload_for_mac()), hashlib.sha256).hexdigest()
+    return hmac.new(key, canon(_mac_payload(record)), hashlib.sha256).hexdigest()
 
 
 def verify_record_mac(key: bytes, raw: dict) -> bool:
-    """校验记录级 HMAC(常数时间比较);字段缺失/多余键即视为不通过。
+    """校验记录级 HMAC(常数时间比较)；按落盘字段重算，兼容旧记录。
 
-    存储层会在落盘时注入 entry_checksum 字段(那是文件行级封缄,不属于记录语义),
-    因此这里只取 RequestRecord 声明的字段参与重算,其余键一律忽略。
+    存储层会在落盘时注入 entry_checksum 字段(文件行级封缄，不属于记录语义)；
+    这里只取 RequestRecord 声明的字段，且只取 raw 中实际存在的键参与重算。
     """
     try:
         stored = str(raw["record_mac"])
         record = RequestRecord(**{k: v for k, v in raw.items() if k in _RECORD_FIELDS})
     except (KeyError, TypeError):
         return False
-    return hmac.compare_digest(stored, record_mac(key, record))
+    payload = _mac_payload(record, set(raw))
+    expected = hmac.new(key, canon(payload), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(stored, expected)
 
 
 def verify_chain_link(raw: dict) -> bool:
