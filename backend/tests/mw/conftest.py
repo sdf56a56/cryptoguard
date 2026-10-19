@@ -4,14 +4,14 @@
 设计:
   - 数据目录用 pytest 的 tmp_path:不触碰仓库里的 data/,每个测试独立信任根;
   - 提供商固定为 mock(确定性回显),真实上游的测试**不在此处伪造**,
-    而是标记为 skip 并注明需要真实密钥(见 test_real_upstream_placeholder);
+    而是标记为 skip 并注明需要真实密钥(见 test_real_http_e2e.py 的可选用例);
   - 客户端密钥经 CG_BOOTSTRAP_KEY_FILE 落到临时文件,测试从文件读取(不猜格式)。
 """
 from __future__ import annotations
 
 import os
 
-os.environ.setdefault("CG_NO_BOOT", "1")   # 不触发演示平台的 lifespan 装配
+os.environ.setdefault("CG_NO_BOOT", "1")   # 不触发 lifespan 的自动装配
 
 import pytest
 from fastapi.testclient import TestClient

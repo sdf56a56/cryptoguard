@@ -386,7 +386,7 @@ def load_settings(env_path: Path | None = None) -> Settings:
     )
     providers = _parse_providers(env, defaults)
 
-    mode_raw = env.get("CG_PROTECTION_MODE", "placeholder").lower()
+    mode_raw = env.get("CG_PROTECTION_MODE", "token").lower()
     protection_mode = _PROTECTION_ALIASES.get(mode_raw)
     if protection_mode is None:
         raise ConfigError(

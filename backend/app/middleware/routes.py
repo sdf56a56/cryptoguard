@@ -89,7 +89,7 @@ _touch_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
-# 请求体积限制(只作用于 /v1/* 与 /admin/*,不影响既有 /api/* 的文件上传)
+# 请求体积限制(只作用于 /v1/* 与 /admin/*)
 # --------------------------------------------------------------------------- #
 class BodyLimitMiddleware:
     """纯 ASGI 中间件:按 Content-Length 与累计字节数限制请求体。
@@ -98,7 +98,7 @@ class BodyLimitMiddleware:
     MiddlewareApp.settings 读取,因此中间件本身无需在装配前拿到配置。
     """
 
-    DEFAULT_MAX_BYTES = 1_048_576
+    DEFAULT_MAX_BYTES = 8_388_608
 
     def __init__(self, app, max_bytes: int | None = None,
                  prefixes: tuple[str, ...] = ("/v1/", "/admin/")):

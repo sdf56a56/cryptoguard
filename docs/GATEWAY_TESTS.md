@@ -18,7 +18,7 @@ npm run build
 - `tests/mw/`：网关契约与安全测试（认证、保护/还原、审计、流式、确认、
   内容策略、幂等、心跳、413 形状、管理面权限、Responses、实例锁）。
 - 当前收集到 **354** 个用例（2026-10 控制台/托管 Provider 后）；真实厂商用例默认 skip。
-- 前端：`vitest run` 覆盖 API 错误解析 / SSE 帧解析 / 格式化 / 基础组件；`vite build` 作为集成校验。
+- 前端：`vitest run` 覆盖 API 错误解析 / SSE 帧解析 / 格式化 / 基础组件，当前 **17** 个用例；`vite build` 作为集成校验。
 - 真实厂商上游测试沿用 `tests/mw/test_real_http_e2e.py::test_real_vendor_upstream_opt_in`，
   默认跳过；需要 `CG_REAL_UPSTREAM_KEY` / `CG_REAL_UPSTREAM_URL` / `CG_REAL_MODEL`。
 
@@ -38,7 +38,7 @@ npm run build
 | Responses | `test_responses_api.py` | 文本/流式/function_call；拒绝有状态与内置工具 |
 | 管理面权限 | `test_admin_rbac.py` | 管理员令牌；客户端过期；PATCH；provider 测试；实例锁 |
 | 托管 Provider | `test_provider_admin.py` | 加密落盘、无密钥回显、CRUD 热生效、同名覆盖/恢复、默认项校验、生产最后一项 409 |
-| 看板 | `test_dashboard.py` | 未认证 401、零态、真实计数、只统计 `/v1/*`、不泄漏密钥 |
+| 看板 | `test_dashboard.py` | 未认证 401、零态、真实计数、不泄漏密钥（实现按 `/v1/*` 过滤控制台轮询） |
 | 指标快照 | `test_metrics_snapshot.py` | snapshot 结构、直方图分位数 |
 | 演示平台已删除 | `test_no_demo_routes.py` | 路由表无 `/api/*`、无静态挂载/SPA catch-all |
 

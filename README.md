@@ -36,7 +36,9 @@ cd backend
 python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# 至少填写 VAULT_KEY 与 CG_ADMIN_TOKEN（控制台登录用）
+# 建议填写 VAULT_KEY 与 CG_ADMIN_TOKEN（控制台登录用）
+# 未填 VAULT_KEY 且 data/ 无历史记录时，首次启动会自动生成并写回 backend/.env
+# （生产请显式设置并备份）
 # 上游 Provider 可以在 .env 的 CG_PROVIDERS 中配置，也可以登录控制台后创建
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1
 ```
@@ -53,7 +55,7 @@ npm run dev          # http://127.0.0.1:5173
 - 控制台托管的 Provider 配置整体 AES-256-GCM 加密落盘（`data/config/provider-config.enc.json`），
   保存后立即生效；同名托管项覆盖 `CG_PROVIDERS` 中的环境变量项，删除托管项后恢复。
 - 托管密钥由 `VAULT_KEY` 派生密钥保护：**更换 VAULT_KEY 会导致托管配置无法解密**，
-  启动会 fail-closed 并给出恢复提示。
+  生产环境直接拒绝启动，开发环境以 503 不可用状态启动并给出恢复提示。
 - 控制台自身不托管静态资源；生产部署请用反向代理把 `/health`、`/ready`、`/metrics`、
   `/v1`、`/admin` 转到网关，并把 `frontend/dist` 作为静态站点。
 
@@ -115,7 +117,7 @@ Codex / Responses：
   需要横向扩展时，必须先把这些状态外置到共享存储（当前未实现）。
 - **图片/文档不做 OCR 抽取检测**：默认拒绝，而不是假装保护。
 - **不执行模型生成的工具调用**：网关只做保护 / 转发 / 审计。
-- **控制台托管的上游密钥**：整体加密落盘，接口只回 `has_key` / `key_source`；
+- **控制台托管的上游密钥**：整体加密落盘，接口只回 `has_key` / `key_source` 等非敏感字段；
   持有 `VAULT_KEY` 与 `data/` 的本地攻击者仍可解密（与现有本地信任边界一致）。
   管理面可以把上游指向任意 http(s) 地址，这是管理员权限的一部分。
 
@@ -126,11 +128,11 @@ Codex / Responses：
 | GET | `/health` | 健康摘要（无认证、无密钥） |
 | GET | `/ready` | 就绪：装配 / provider / 审计链 |
 | GET | `/metrics` | Prometheus 文本（默认需管理员令牌） |
-| GET | `/v1/models` | 模型列表 + 能力（streaming/tools/responses/images） |
+| GET | `/v1/models` | 模型列表 + 能力（streaming/tools/anthropic_messages/responses/images/documents） |
 | POST | `/v1/chat/completions` | OpenAI Chat（非流式 / SSE） |
 | POST | `/v1/messages` | Anthropic Messages（Claude Code） |
 | POST | `/v1/responses` | OpenAI Responses（Codex 无状态子集） |
-| POST | `/v1/verify` | 校验自己的请求记录与摘要 |
+| POST | `/v1/verify` | 校验自己的请求记录与摘要（管理员令牌可查任意 request_id） |
 | GET/POST | `/v1/confirmations` | 人工确认申请 / 列表 |
 | GET | `/v1/confirmations/{id}` | 查询状态 |
 | POST | `/v1/confirmations/{id}/release` | 一次性释放（需管理员批准） |
@@ -141,7 +143,8 @@ Codex / Responses：
 | GET/POST | `/admin/clients` | 客户端密钥列表 / 签发 |
 | PATCH | `/admin/clients/{id}` | 更新名称/模型/限额/模式/过期 |
 | POST | `/admin/clients/{id}/revoke`、`/rotate` | 撤销 / 轮换 |
-| GET/POST | `/admin/confirmations` | 待确认队列 / 批准 / 拒绝 |
+| GET | `/admin/confirmations` | 待确认队列（可按 status / client_id 过滤） |
+| POST | `/admin/confirmations/{id}/approve`、`/deny` | 批准 / 拒绝 |
 | GET | `/admin/providers` | Provider 视图（来源 / 密钥状态 / 模型 / 默认项；无密钥值） |
 | POST | `/admin/providers` | 新增控制台托管 Provider（保存即生效） |
 | PATCH/DELETE | `/admin/providers/{name}` | 更新 / 删除托管 Provider |
@@ -161,7 +164,7 @@ backend/
 │   ├── keys.py              # VAULT_KEY / HKDF / 指纹（信任根）
 │   ├── store.py             # SealedNDJSON（逐行 HMAC 封缄）
 │   ├── canon.py             # RFC 8785 JCS 规范化
-│   ├── detection.py         # 13 类敏感实体识别
+│   ├── detection.py         # 13 类基础敏感实体识别（扩展凭证规则见 middleware/recognizers.py）
 │   ├── crypto/aead.py       # AES-256-GCM
 │   └── middleware/          # 网关核心（保护/还原/策略/审计/提供商/协议）
 │       ├── provider_config.py   # 控制台托管 Provider：加密落盘 / 校验 / 热生效

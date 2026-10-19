@@ -6,7 +6,7 @@
 cd backend
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env          # 至少填 VAULT_KEY / CG_ADMIN_TOKEN
+cp .env.example .env          # 建议填 VAULT_KEY / CG_ADMIN_TOKEN（无历史数据时首次启动自动生成 VAULT_KEY）
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1
 ```
 
@@ -19,4 +19,4 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1
 - Agent 接入：`../docs/AGENT_INTEGRATION.md`
 
 注意：不支持多 worker / 多副本；同一 `data/` 目录只允许一个实例。
-更换 `VAULT_KEY` 会导致托管 Provider 配置与历史审计无法解密/校验。
+更换 `VAULT_KEY` 会导致托管 Provider 配置无法解密、历史审计无法通过 MAC/链校验。

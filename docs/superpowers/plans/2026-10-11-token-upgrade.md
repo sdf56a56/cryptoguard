@@ -1,5 +1,9 @@
 # CryptoGuard-LLM 分级令牌化升级 Implementation Plan
 
+> **历史归档（2026-10）**：本文描述的是已删除的演示平台（`/api/*`、聊天查看器、
+> 密码学实验室等），不代表当前实现，也不应作为部署依据。当前网关文档见
+> [GATEWAY.md](../../GATEWAY.md)。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把占位符替换升级为 T1-T4 分级密码学令牌管道,覆盖文件上传双通道,四层协议绑定令牌/文件/用户决策,UI 收敛为六步协议叙事单线,并用测试套件锁死全部承诺指标。
