@@ -482,15 +482,19 @@ class ResponsesStreamTranslator:
     def _open_tool(self, index: int, name: str, call_id: str) -> list[tuple[str, dict]]:
         if self._tool_open.get(index):
             return []
+        # 文本输出项必须先收尾：Responses 的 output_item 各自独立占 output_index，
+        # 不能与仍在打开的文本项共用同一个 index。
+        out = self._close_text()
         item_id = f"fc_{uuid.uuid4().hex[:16]}"
         self._tool_item_ids[index] = item_id
         self._tool_open[index] = True
         self.tool_calls.setdefault(index, {"id": call_id, "name": name, "arguments": ""})
-        return [self._event("response.output_item.added", {
+        out.append(self._event("response.output_item.added", {
             "output_index": len(self._output) + len(self.tool_calls) - 1,
             "item": {"type": "function_call", "id": item_id, "call_id": call_id,
                      "name": name, "arguments": "", "status": "in_progress"},
-        })]
+        }))
+        return out
 
     def _close_tool(self, index: int) -> list[tuple[str, dict]]:
         if not self._tool_open.get(index):

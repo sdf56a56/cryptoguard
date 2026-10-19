@@ -13,7 +13,7 @@ python -m pytest tests -q
 - `tests/core/`：信任根、封缄存储、JCS 规范化、敏感实体识别；
 - `tests/mw/`：网关契约与安全测试（认证、保护/还原、审计、流式、确认、
   内容策略、幂等、心跳、413 形状、管理面权限、Responses、实例锁）。
-- 当前收集到 **336** 个用例（2026-10 重构后）；真实厂商用例默认 skip。
+- 当前收集到 **339** 个用例（2026-10 重构后）；真实厂商用例默认 skip。
 - 真实厂商上游测试沿用 `tests/mw/test_real_http_e2e.py::test_real_vendor_upstream_opt_in`，
   默认跳过；需要 `CG_REAL_UPSTREAM_KEY` / `CG_REAL_UPSTREAM_URL` / `CG_REAL_MODEL`。
 

@@ -536,3 +536,30 @@ def test_echo_upstream_received_only_tokens_for_anthropic_requests(agent_env):
     protected = _received_text(sent)
     assert PHONE not in protected and EMAIL not in protected
     assert "[CG_TOKEN_" in protected
+
+
+def test_openai_reasoning_effort_is_forwarded_to_compatible_upstream(agent_env):
+    _, client, auth, upstream = agent_env(subdir="agent-reasoning")
+    body = _openai_body()
+    body["reasoning_effort"] = "high"
+    body["verbosity"] = "low"
+    response = client.post("/v1/chat/completions", json=body, headers=auth)
+    assert response.status_code == 200, response.text
+    sent = json.loads(upstream.requests[-1]["body"].decode("utf-8"))
+    assert sent["reasoning_effort"] == "high"
+    assert sent["verbosity"] == "low"
+
+
+def test_openai_only_params_are_rejected_on_anthropic_upstream(make_mw):
+    from app.middleware.config import ProviderSettings
+
+    provider = ProviderSettings(
+        name="up", type="anthropic", base_url="https://upstream.invalid",
+        api_key_env="CG_TEST_ANTHROPIC_KEY", models=("mock-chat",))
+    _, client, key = make_mw(providers=(provider,), default_provider="up",
+                             data_subdir="agent-anthropic-params")
+    response = client.post("/v1/chat/completions",
+                           headers={"Authorization": f"Bearer {key}"},
+                           json={**_openai_body(), "reasoning_effort": "high"})
+    assert response.status_code == 400, response.text
+    assert "openai-compatible" in response.text

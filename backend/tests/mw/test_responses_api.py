@@ -119,3 +119,22 @@ def test_responses_accepts_function_call_output_history(make_mw):
     sent = str(state.registry.get("mock").seen[-1].messages)
     assert PHONE not in sent
     assert "role" in sent and "tool" in sent
+
+
+def test_responses_stream_text_then_tool_keeps_output_indexes_distinct():
+    """文本项与工具项各自占一个 output_index，不能因为文本未收尾而重叠。"""
+    from app.middleware.providers.base import StreamChunk
+    from app.middleware.responses_proto import ResponsesStreamTranslator
+
+    translator = ResponsesStreamTranslator(model="m", request_id="cg-x", created=1)
+    events = translator.start()
+    events += translator.feed(StreamChunk("text", text="先说话"))
+    events += translator.feed(StreamChunk("tool_call", tool_index=0,
+                                           tool_id="call_1", tool_name="t",
+                                           tool_arguments='{"a":1}'))
+    events += translator.feed(StreamChunk("done", finish_reason="tool_calls"))
+    events += translator.finish()
+    added = [payload for name, payload in events
+             if name == "response.output_item.added"]
+    indexes = [payload["output_index"] for payload in added]
+    assert indexes == sorted(set(indexes)), indexes
