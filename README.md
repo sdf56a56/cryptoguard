@@ -36,6 +36,10 @@ cp .env.example .env
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1
 ```
 
+> **升级提示**：已有 `backend/.env` 会覆盖新默认值（例如旧的
+> `CG_PROTECTION_MODE=placeholder` / `CG_MAX_REQUEST_BYTES=1048576`）。请对照
+> `.env.example` 更新，尤其是内容策略、请求体上限与单实例锁。
+
 首次启动（开发环境）会生成一个客户端密钥，写到 `CG_BOOTSTRAP_KEY_FILE` 或打印到
 stderr，**只显示一次**。生产环境不自动生成，请用管理员令牌显式签发：
 

@@ -102,25 +102,38 @@ def _walk_cache_control(node: Any, *, policy: str, result: ContentPolicyResult,
             _walk_cache_control(item, policy=policy, result=result, depth=depth + 1)
 
 
-def _walk_unknown_blocks(node: Any, *, result: ContentPolicyResult,
-                         depth: int = 0) -> None:
-    """登记会被协议转换丢弃的 Anthropic 私有块（不静默 continue）。"""
-    if depth > _MAX_DEPTH:
-        return
+def _iter_message_blocks(body: dict):
+    """只遍历消息内容块，不递归工具 schema / tool_choice 里的 `type` 字段。"""
+    system = body.get("system")
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict):
+                yield block
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            yield block
+            if block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                for inner in block["content"]:
+                    if isinstance(inner, dict):
+                        yield inner
+
+
+def _walk_unknown_blocks(body: dict, *, result: ContentPolicyResult) -> None:
+    """登记会被协议转换丢弃的 Anthropic 私有内容块（不静默 continue）。"""
     known = {"text", "image", "document", "tool_use", "tool_result"}
-    if isinstance(node, dict):
-        if node.get("type") in ("thinking", "redacted_thinking"):
+    for block in _iter_message_blocks(body):
+        btype = block.get("type")
+        if btype in ("thinking", "redacted_thinking"):
             result.note("thinking_blocks")
-        elif node.get("type") == "cache_control":
-            pass
-        elif node.get("type") not in known and node.get("type") is not None \
-                and isinstance(node.get("type"), str):
-            result.note(f"block:{node.get('type')}")
-        for value in node.values():
-            _walk_unknown_blocks(value, result=result, depth=depth + 1)
-    elif isinstance(node, list):
-        for item in node:
-            _walk_unknown_blocks(item, result=result, depth=depth + 1)
+        elif isinstance(btype, str) and btype not in known:
+            result.note(f"block:{btype}")
 
 
 def check_openai_request(body: dict, settings) -> ContentPolicyResult:
@@ -146,7 +159,12 @@ def check_anthropic_request(body: dict, settings) -> ContentPolicyResult:
         result.note("thinking")
 
     _walk_cache_control(body, policy=settings.cache_control, result=result)
-    _walk_images_and_documents(body, image_policy=settings.image_policy,
-                               document_policy=settings.document_policy, result=result)
+    # 只扫描 system / messages 内容，不把工具 input_schema 里的 "type" 当内容块
+    for key in ("system", "messages"):
+        if key in body:
+            _walk_images_and_documents(body.get(key),
+                                       image_policy=settings.image_policy,
+                                       document_policy=settings.document_policy,
+                                       result=result)
     _walk_unknown_blocks(body, result=result)
     return result

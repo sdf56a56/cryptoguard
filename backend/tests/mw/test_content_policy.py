@@ -110,3 +110,19 @@ def test_unknown_anthropic_block_is_recorded_not_silently_ignored(make_mw):
     assert response.status_code == 200, response.text
     ignored = response.json()["cryptoguard"]["ignored_fields"]
     assert "block:server_tool_use" in ignored
+
+
+def test_tool_schema_types_are_not_mistaken_for_unknown_blocks(make_mw):
+    _, client, key = make_mw(data_subdir="tool-schema")
+    response = client.post("/v1/messages", headers=_anthropic_headers(key), json={
+        "model": "mock-chat", "max_tokens": 32,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "t", "input_schema": {
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+        }}],
+        "tool_choice": {"type": "auto"},
+    })
+    assert response.status_code == 200, response.text
+    ignored = response.json()["cryptoguard"]["ignored_fields"]
+    assert not any(item.startswith("block:") for item in ignored), ignored
