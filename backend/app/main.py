@@ -78,14 +78,21 @@ async def _lifespan(app: FastAPI):
         raise RuntimeError(
             f"检测到 {workers} 个 worker：本网关的确认/金库/限流/审计为进程内状态，"
             "只支持单进程(--workers 1)。请勿用 gunicorn 多 worker 启动。")
-    lock = None
-    try:
-        from .middleware.instance import InstanceLock
+    from .middleware.instance import InstanceLock
 
-        if settings.instance_lock:
-            lock = InstanceLock(default_data_dir() / ".cryptoguard.lock")
+    lock = None
+    if settings.instance_lock:
+        lock = InstanceLock(default_data_dir() / ".cryptoguard.lock")
+        try:
             lock.acquire()
-            app.state.instance_lock = lock
+        except MiddlewareError as exc:
+            # 实例锁失败是部署错误，不能降级成“无锁继续跑”：那会让第二个进程
+            # 与第一个进程分叉确认/金库/审计状态。无论开发/生产都直接拒绝启动。
+            logger.critical("实例锁获取失败，拒绝启动: %s", exc.detail, exc_info=True)
+            raise
+        app.state.instance_lock = lock
+
+    try:
         app.state.middleware = build_middleware(default_data_dir(), settings=settings)
         try:
             import anyio

@@ -87,6 +87,8 @@ class MiddlewareApp:
             "audit": audit_view,
             "vault": self.token_vault.stats(),
             "confirmations": self.confirmations.stats(),
+            "idempotency": (self.idempotency.stats()
+                            if self.idempotency is not None else {}),
             "deployment": {
                 "mode": "single-process",
                 "instance_lock": bool(self.settings.instance_lock),

@@ -1317,6 +1317,20 @@ def admin_policies(request: Request) -> Response:
         "policy": app.settings.public_policy(),
         "providers": app.settings.provider_public_view(),
         "models": app.registry.list_model_ids(),
+        "deployment": {
+            "mode": "single-process",
+            "instance_lock": bool(app.settings.instance_lock),
+            "note": "多 worker/多副本不受支持；确认/金库/限流/审计为进程内状态",
+        },
+        "limits": {
+            "rate_limit_per_min": app.settings.rate_limit_per_min,
+            "max_concurrency": app.settings.max_concurrency,
+            "max_request_bytes": app.settings.max_request_bytes,
+            "sse_heartbeat_s": app.settings.sse_heartbeat_s,
+            "idempotency_ttl_s": app.settings.idempotency_ttl_s,
+            "idempotency_max": app.settings.idempotency_max,
+        },
+        "idempotency": app.idempotency.stats() if app.idempotency else {},
         "protection_modes": ["placeholder", "token", "encrypt"],
         "restore_modes": ["off", "confirm", "categories", "auto"],
         "detection": {
