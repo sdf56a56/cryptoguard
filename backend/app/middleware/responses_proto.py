@@ -48,8 +48,11 @@ def _content_parts(content: Any) -> list[dict]:
         raise _bad("Responses input.content 必须是字符串或数组")
     parts: list[dict] = []
     for block in content:
+        if isinstance(block, str):
+            parts.append({"type": "text", "text": block})
+            continue
         if not isinstance(block, dict):
-            raise _bad("Responses content 分块必须是对象")
+            raise _bad("Responses content 分块必须是对象或字符串")
         btype = block.get("type")
         if btype in ("input_text", "output_text", "text"):
             parts.append({"type": "text", "text": str(block.get("text") or "")})
@@ -238,8 +241,9 @@ def from_responses_request(body: dict) -> ResponsesRequest:
         raise _bad("store=true 不受支持：网关不在上游留存响应")
     if body.get("background") is True:
         raise _bad("background 后台任务不受支持")
-    if body.get("truncation") not in (None, "disabled"):
-        raise _bad("truncation 不受支持（网关不截断上下文）")
+    truncation = body.get("truncation")
+    if truncation not in (None, "disabled", "auto"):
+        raise _bad("truncation 只能为 disabled|auto（网关不截断上下文）")
     if body.get("metadata"):
         raise _bad("metadata 不受支持：可能夹带未经保护的用户标识")
     if body.get("safety_identifier"):
@@ -278,6 +282,8 @@ def from_responses_request(body: dict) -> ResponsesRequest:
     ignored: list[str] = []
     if body.get("include"):
         ignored.append("include")
+    if truncation == "auto":
+        ignored.append("truncation")
     if reasoning is not None and reasoning.get("summary") is not None:
         ignored.append("reasoning.summary")
 
