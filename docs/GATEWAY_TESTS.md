@@ -8,12 +8,17 @@
 ```bash
 cd backend
 python -m pytest tests -q
+
+cd ../frontend
+npm test
+npm run build
 ```
 
 - `tests/core/`：信任根、封缄存储、JCS 规范化、敏感实体识别；
 - `tests/mw/`：网关契约与安全测试（认证、保护/还原、审计、流式、确认、
   内容策略、幂等、心跳、413 形状、管理面权限、Responses、实例锁）。
-- 当前收集到 **340** 个用例（2026-10 重构后）；真实厂商用例默认 skip。
+- 当前收集到 **354** 个用例（2026-10 控制台/托管 Provider 后）；真实厂商用例默认 skip。
+- 前端：`vitest run` 覆盖 API 错误解析 / SSE 帧解析 / 格式化 / 基础组件；`vite build` 作为集成校验。
 - 真实厂商上游测试沿用 `tests/mw/test_real_http_e2e.py::test_real_vendor_upstream_opt_in`，
   默认跳过；需要 `CG_REAL_UPSTREAM_KEY` / `CG_REAL_UPSTREAM_URL` / `CG_REAL_MODEL`。
 
@@ -31,7 +36,10 @@ python -m pytest tests -q
 | 内容面 | `test_content_policy.py` | 图片/文档默认拒绝；pass 登记未保护；cache_control/thinking 显式 ignored |
 | 幂等/心跳/413 | `test_robustness.py` | 重放不二次调用上游；409；`: ping`；Anthropic 413 形状 |
 | Responses | `test_responses_api.py` | 文本/流式/function_call；拒绝有状态与内置工具 |
-| 管理面权限 | `test_admin_rbac.py` | 只读令牌只读；客户端过期；PATCH；provider 测试；实例锁 |
+| 管理面权限 | `test_admin_rbac.py` | 管理员令牌；客户端过期；PATCH；provider 测试；实例锁 |
+| 托管 Provider | `test_provider_admin.py` | 加密落盘、无密钥回显、CRUD 热生效、同名覆盖/恢复、默认项校验、生产最后一项 409 |
+| 看板 | `test_dashboard.py` | 未认证 401、零态、真实计数、只统计 `/v1/*`、不泄漏密钥 |
+| 指标快照 | `test_metrics_snapshot.py` | snapshot 结构、直方图分位数 |
 | 演示平台已删除 | `test_no_demo_routes.py` | 路由表无 `/api/*`、无静态挂载/SPA catch-all |
 
 ## 3. 手工验收
@@ -43,8 +51,16 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1
 curl -s localhost:8100/health
 curl -s localhost:8100/ready
 curl -s -H "X-Admin-Token: $CG_ADMIN_TOKEN" localhost:8100/metrics | head
+curl -s -H "X-Admin-Token: $CG_ADMIN_TOKEN" localhost:8100/admin/dashboard | head -c 800
 
-# 演示端点应全部 404
+# 控制台（另开终端）
+cd ../frontend && npm install && npm run dev
+# 浏览器打开 http://127.0.0.1:5173 ，用 CG_ADMIN_TOKEN 登录
+# 1) 上游配置 → 新增 Provider（mock 或真实上游）→ 测试连通性
+# 2) 客户端密钥 → 签发密钥 → 链路测试 → 发送请求
+# 3) 概览应出现 /v1/* 计数、延迟、敏感检出；请求日志可查看该 request_id
+
+# 演示端点应全部 404（控制台不在网关端口上）
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8100/api/health
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8100/
 

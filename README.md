@@ -3,9 +3,10 @@
 > Agent / SDK / Claude Code / Codex 与模型服务商之间的**单进程安全网关**：
 > 出站识别并保护敏感数据，回程按策略受控还原，全程写不含明文的可验证审计。
 >
-> 本仓库的后端已经收敛为只做这件事。原演示平台（`/api/*`、聊天查看器、密码学
-> 实验室、攻击沙箱、验收面板、前端静态托管）已全部删除；`frontend/` 目录保留但
-> 与当前后端**不再兼容**，需要另立项目删除或重写。
+> 本仓库由「单进程网关 + 独立运维控制台」组成。原演示平台（`/api/*`、聊天查看器、
+> 密码学实验室、攻击沙箱、验收面板、前端静态托管）已全部删除；`frontend/` 已重写为
+> 面向运维的控制台：实时看板、上游 Provider 配置、客户端密钥、审计与人工确认、
+> 链路测试。控制台与网关分开运行，通过 Vite 代理访问 `/v1`、`/admin` 等路径。
 
 ## 它能做什么
 
@@ -22,8 +23,11 @@ Agent / SDK ──▶ CryptoGuard ──▶ Provider ──▶ CryptoGuard ─�
 - **默认扣留高风险数据**：手机号/身份证/银行卡/私钥/口令/连接串等不会自动还原；
   需要时走「客户端申请 → 管理员批准 → 一次性释放」；
 - **可验证审计**：请求/响应 JCS 摘要、记录级 HMAC、哈希链、`/v1/verify`；
-- **运维面**：`/health`、`/ready`、`/metrics`（Prometheus 文本）、provider 连通性
-  测试、客户端密钥签发/撤销/轮换/更新/过期。
+- **运维面**：`/health`、`/ready`、`/metrics`（Prometheus 文本）、`/admin/dashboard`
+  看板快照、provider 连通性测试、客户端密钥签发/撤销/轮换/更新/过期；
+- **控制台**：实时看板、请求日志与详情、待确认队列、客户端密钥、上游配置、
+  策略与审计链、链路测试（非流式 / 流式）。平台只有一个全权管理员，
+  不存在只读角色。
 
 ## 快速启动
 
@@ -32,9 +36,26 @@ cd backend
 python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# 至少填写 VAULT_KEY / CG_ADMIN_TOKEN / CG_PROVIDERS 与上游密钥环境变量
+# 至少填写 VAULT_KEY 与 CG_ADMIN_TOKEN（控制台登录用）
+# 上游 Provider 可以在 .env 的 CG_PROVIDERS 中配置，也可以登录控制台后创建
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1
 ```
+
+另开一个终端启动控制台（默认代理到 127.0.0.1:8100）：
+
+```bash
+cd frontend
+npm install
+npm run dev          # http://127.0.0.1:5173
+```
+
+- 登录令牌就是后端 `CG_ADMIN_TOKEN`；令牌只保存在当前标签页的 `sessionStorage`。
+- 控制台托管的 Provider 配置整体 AES-256-GCM 加密落盘（`data/config/provider-config.enc.json`），
+  保存后立即生效；同名托管项覆盖 `CG_PROVIDERS` 中的环境变量项，删除托管项后恢复。
+- 托管密钥由 `VAULT_KEY` 派生密钥保护：**更换 VAULT_KEY 会导致托管配置无法解密**，
+  启动会 fail-closed 并给出恢复提示。
+- 控制台自身不托管静态资源；生产部署请用反向代理把 `/health`、`/ready`、`/metrics`、
+  `/v1`、`/admin` 转到网关，并把 `frontend/dist` 作为静态站点。
 
 > **升级提示**：已有 `backend/.env` 会覆盖新默认值（例如旧的
 > `CG_PROTECTION_MODE=placeholder` / `CG_MAX_REQUEST_BYTES=1048576`）。请对照
@@ -94,6 +115,9 @@ Codex / Responses：
   需要横向扩展时，必须先把这些状态外置到共享存储（当前未实现）。
 - **图片/文档不做 OCR 抽取检测**：默认拒绝，而不是假装保护。
 - **不执行模型生成的工具调用**：网关只做保护 / 转发 / 审计。
+- **控制台托管的上游密钥**：整体加密落盘，接口只回 `has_key` / `key_source`；
+  持有 `VAULT_KEY` 与 `data/` 的本地攻击者仍可解密（与现有本地信任边界一致）。
+  管理面可以把上游指向任意 http(s) 地址，这是管理员权限的一部分。
 
 ## 接口
 
@@ -110,6 +134,7 @@ Codex / Responses：
 | GET/POST | `/v1/confirmations` | 人工确认申请 / 列表 |
 | GET | `/v1/confirmations/{id}` | 查询状态 |
 | POST | `/v1/confirmations/{id}/release` | 一次性释放（需管理员批准） |
+| GET | `/admin/dashboard` | 控制台看板快照（业务请求计数 / 延迟 / 检出 / 待确认 / 审计链尾） |
 | GET | `/admin/security/policies` | 生效策略视图 |
 | GET | `/admin/audit`、`/admin/audit/{rid}` | 审计分页 / 单条 |
 | POST | `/admin/audit/verify`、`/admin/audit/purge` | 链校验 / 保留期清理 |
@@ -117,7 +142,10 @@ Codex / Responses：
 | PATCH | `/admin/clients/{id}` | 更新名称/模型/限额/模式/过期 |
 | POST | `/admin/clients/{id}/revoke`、`/rotate` | 撤销 / 轮换 |
 | GET/POST | `/admin/confirmations` | 待确认队列 / 批准 / 拒绝 |
-| GET | `/admin/providers` | provider 配置视图（无密钥） |
+| GET | `/admin/providers` | Provider 视图（来源 / 密钥状态 / 模型 / 默认项；无密钥值） |
+| POST | `/admin/providers` | 新增控制台托管 Provider（保存即生效） |
+| PATCH/DELETE | `/admin/providers/{name}` | 更新 / 删除托管 Provider |
+| PUT | `/admin/provider-defaults` | 设置默认 Provider / 模型 |
 | POST | `/admin/providers/{name}/test` | 上游连通性测试 |
 
 `/v1/messages/count_tokens` **有意不实现**（显式 404）：精确计数需要把未保护文本
@@ -136,12 +164,16 @@ backend/
 │   ├── detection.py         # 13 类敏感实体识别
 │   ├── crypto/aead.py       # AES-256-GCM
 │   └── middleware/          # 网关核心（保护/还原/策略/审计/提供商/协议）
+│       ├── provider_config.py   # 控制台托管 Provider：加密落盘 / 校验 / 热生效
+│       ├── metrics.py           # Prometheus 文本 + 看板 JSON 快照
+│       └── routes.py            # /v1、/admin、健康/就绪/指标
 ├── tests/
-│   ├── core/                # keys / store / canon / detection
+│   ├── core/                # keys / store / canon / detection / metrics
 │   └── mw/                  # 网关契约与安全测试
 ├── requirements.txt
 ├── pyproject.toml
 └── .env.example
+frontend/                    # Vite + React 控制台（独立运行，代理到网关）
 docs/
 ├── GATEWAY.md               # 架构、配置、协议与边界
 ├── GATEWAY_TESTS.md         # 测试证据与运行方式
@@ -153,6 +185,10 @@ docs/
 ```bash
 cd backend
 python -m pytest tests -q
+
+cd ../frontend
+npm test
+npm run build
 ```
 
 ## 明确不承诺

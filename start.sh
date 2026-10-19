@@ -20,6 +20,7 @@ echo "============================================"
 echo "  CryptoGuard 安全中转网关（单进程）"
 echo "  监听: http://${HOST}:${PORT}"
 echo "  注意: 不支持多 worker；同 data/ 目录只允许一个实例"
+echo "  控制台: ./start-ui.sh  (http://127.0.0.1:5173)"
 echo "============================================"
 
 exec "$PY" -m uvicorn app.main:app --host "$HOST" --port "$PORT" --workers 1

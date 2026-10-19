@@ -5,28 +5,6 @@ import time
 
 from tests.mw.conftest import ADMIN_TOKEN
 
-READONLY = "readonly-token-0123456789"
-
-
-def _readonly_headers() -> dict:
-    return {"X-Admin-Token": READONLY}
-
-
-def test_readonly_admin_can_read_but_not_write(make_mw):
-    _, client, _ = make_mw(admin_readonly_token=READONLY)
-
-    assert client.get("/admin/clients", headers=_readonly_headers()).status_code == 200
-    assert client.get("/admin/security/policies",
-                      headers=_readonly_headers()).status_code == 200
-    assert client.get("/admin/audit", headers=_readonly_headers()).status_code == 200
-    assert client.get("/metrics", headers=_readonly_headers()).status_code == 200
-
-    created = client.post("/admin/clients", headers=_readonly_headers(),
-                          json={"name": "nope"})
-    assert created.status_code == 403, created.text
-    assert created.json()["error"]["code"] == "forbidden"
-
-
 def test_metrics_requires_admin_by_default(make_mw):
     _, client, _ = make_mw()
     assert client.get("/metrics").status_code == 401

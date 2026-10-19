@@ -146,26 +146,32 @@ class ProviderRegistry:
 
 
 def build_registry(settings, *, transports: dict[str, httpx.BaseTransport] | None = None,
-                   extra_providers: dict[str, ModelProvider] | None = None) -> ProviderRegistry:
+                   extra_providers: dict[str, ModelProvider] | None = None,
+                   key_overrides: dict[str, str] | None = None) -> ProviderRegistry:
     """按 Settings 装配注册表。
 
-    - 密钥在启动期经 ProviderSettings.api_key() 从环境变量读取，只存在于内存；
+    - 密钥在启动期解析后只存在于内存：`key_overrides`（控制台托管、已解密）优先，
+      其次 ProviderSettings.api_key()（环境变量 / backend/.env）；
     - 密钥缺失**不阻断装配**（便于先起服务再补密钥），但调用时由
       ModelProvider.ensure_configured() fail-closed 报 config 错误，绝不出网；
     - transports 仅供测试注入 httpx.MockTransport，生产路径不传。
     """
     transports = transports or {}
+    key_overrides = key_overrides or {}
     providers: dict[str, ModelProvider] = {}
     for p in settings.providers:
         impl = _PROVIDER_TYPES.get(p.type)
         if impl is None:
             raise MiddlewareError("config", f"提供商 {p.name!r} 的 type={p.type!r} 无实现")
+        managed = p.name in key_overrides
         config = ProviderConfig(
             name=p.name,
             type=p.type,
             base_url=p.base_url,
-            api_key=p.api_key(),
+            api_key=(key_overrides.get(p.name) or "") if managed else p.api_key(),
             api_key_env=p.api_key_env,
+            key_source=("managed" if managed else
+                        ("env" if (p.type != "mock" and p.api_key_env) else "none")),
             models=tuple(p.models),
             display_name=p.display_name or p.name,
             timeout_connect=p.timeout_connect,

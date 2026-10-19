@@ -6,6 +6,7 @@ cd /d "%~dp0\backend"
 echo ============================================
 echo   CryptoGuard 安全中转网关（单进程）
 echo   注意: 不支持多 worker；同 data\ 目录只允许一个实例
+echo   控制台: start-ui.bat  (http://127.0.0.1:5173)
 echo ============================================
 echo.
 

@@ -102,7 +102,7 @@ resp = client.chat.completions.create(
 # 本次调用发生了什么（客户端只能查自己发起的 request_id）
 curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"request_id":"cg-…"}' localhost:8100/v1/verify
-# 整条审计链（管理员/只读管理员）
+# 整条审计链（管理员）
 curl -s -H "X-Admin-Token: $CG_ADMIN_TOKEN" -X POST localhost:8100/admin/audit/verify
 # 指标
 curl -s -H "X-Admin-Token: $CG_ADMIN_TOKEN" localhost:8100/metrics

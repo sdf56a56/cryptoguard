@@ -310,43 +310,32 @@ class ClientKeyStore:
 # 管理员认证
 # --------------------------------------------------------------------------- #
 class AdminAuthenticator:
-    """管理员接口认证:全权令牌 + 可选只读令牌,常数时间比较。
+    """管理员接口认证:单用户、全权令牌,常数时间比较。
 
-    - 未配置任何令牌:开发环境返回明确 503,生产环境启动期已 fail-fast;
-    - 只读令牌只能调用 `write=False` 的接口(GET 类查询、/metrics、审计校验);
-    - 写操作持只读令牌一律 403,不靠“有没有这个接口”来兜底。
+    平台只有一个管理员用户，不存在只读角色。未配置令牌时开发环境返回明确 503，
+    生产环境启动期已 fail-fast。
     """
 
-    def __init__(self, token: str, *, production: bool = False,
-                 readonly_token: str = ""):
+    def __init__(self, token: str, *, production: bool = False):
         self._token = (token or "").strip()
-        self._readonly = (readonly_token or "").strip()
         self._production = production
 
     @property
     def configured(self) -> bool:
         return bool(self._token)
 
-    @property
-    def readonly_configured(self) -> bool:
-        return bool(self._readonly)
-
-    def require(self, presented: str | None, *, write: bool = True) -> str:
-        """校验管理员凭证;返回 "admin" 或 "readonly"。"""
+    def require(self, presented: str | None) -> str:
+        """校验管理员凭证;成功返回 "admin"。"""
         presented = str(presented or "").strip()
-        if not self._token and not self._readonly:
+        if not self._token:
             raise MiddlewareError(
                 "config",
                 "管理员接口未启用:请设置 CG_ADMIN_TOKEN 后重启"
                 "(开发环境也需显式配置,避免无凭证的管理面)")
         if not presented:
             raise MiddlewareError("auth", "缺少管理员令牌(X-Admin-Token)")
-        if self._token and hmac.compare_digest(presented, self._token):
+        if hmac.compare_digest(presented, self._token):
             return "admin"
-        if self._readonly and hmac.compare_digest(presented, self._readonly):
-            if write:
-                raise MiddlewareError("forbidden", "只读管理员令牌不能执行写操作")
-            return "readonly"
         logger.warning("admin_auth_failed: 令牌不匹配")
         raise MiddlewareError("auth", "管理员令牌无效")
 

@@ -6,7 +6,8 @@ HKDF 按用途域派生:
   - `client-key/v1`   客户端密钥校验材料的 pepper(见 auth.py)
   - `protection-enc/v*` 保护模式 C 的 AEAD 密钥(版本化,见 protection.py)
   - `audit-mac/v1`    审计记录级 HMAC(见 audit.py)
-存储目录只有 `data/security/`(审计)与 `data/clients/`(客户端密钥摘要)。
+存储目录：`data/security/`(审计)、`data/clients/`(客户端密钥摘要)、
+`data/config/`(控制台托管的上游 Provider 配置,整文件加密)。
 
 首次启动(仅开发环境)会自动生成一个 bootstrap 客户端密钥:写文件(若配置了
 CG_BOOTSTRAP_KEY_FILE)或打印到 stderr **一次**,数据库里只留 HMAC 摘要。
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,13 +25,15 @@ from ..paths import default_data_dir
 from ..keys import Vault
 from .audit import AuditStore
 from .auth import AdminAuthenticator, ClientKeyStore
-from .config import Settings, load_settings
+from .config import Settings, enforce_effective_providers, load_settings
 from .confirmations import ConfirmationStore
 from .errors import MiddlewareError
 from .idempotency import IdempotencyStore
 from .metrics import Metrics
 from .pipeline import Pipeline
 from .protection import KeyRing, TokenVault
+from .provider_config import (ManagedProviderStore, compose_settings_with_store,
+                              managed_meta, provider_views)
 from .providers.registry import ProviderRegistry, build_registry
 from .ratelimit import ConcurrencyGuard, SlidingWindowLimiter
 from .recognizers import DetectorConfig
@@ -59,11 +63,40 @@ class MiddlewareApp:
     metrics: Metrics = field(default_factory=Metrics)
     idempotency: IdempotencyStore | None = None
     bootstrap_key: str = ""      # 仅在开发环境自动生成时非空(只回显一次)
+    #: 启动时的环境变量配置（托管配置合并前的基底；热生效时用于重新合成）
+    base_settings: Settings | None = None
+    provider_store: ManagedProviderStore | None = None
+    #: 测试注入的 httpx transport；热重建 registry 时沿用
+    transports: dict = field(default_factory=dict)
+    #: 热切换后退役的 registry：在途请求可能仍在用，进程退出时统一关闭
+    retired_registries: list = field(default_factory=list)
+    provider_lock: object = field(default_factory=threading.RLock)
 
     # ------------------------------------------------------------------ #
+    def effective_provider_views(self) -> list[dict]:
+        """有效 Provider 视图（含托管配置来源与运行期密钥状态）。"""
+        if self.provider_store is None:
+            return _provider_views(self.settings, self.registry)
+        base = self.base_settings or self.settings
+        return provider_views(self.settings, self.registry, self.provider_store,
+                              {p.name for p in base.providers})
+
+    def close(self) -> None:
+        """关闭当前与退役的 Provider 连接池（进程退出时调用）。"""
+        seen: set[int] = set()
+        for registry in [self.registry, *self.retired_registries]:
+            if registry is None or id(registry) in seen:
+                continue
+            seen.add(id(registry))
+            try:
+                registry.close()
+            except Exception as exc:  # noqa: BLE001 — 关闭失败不阻断退出
+                logger.warning("关闭 Provider registry 失败: %s", type(exc).__name__)
+        self.retired_registries.clear()
+
     def health(self) -> dict:
         """健康摘要:**不含任何密钥**,不调用上游(避免健康检查放大成本)。"""
-        providers = _provider_views(self.settings, self.registry)
+        providers = self.effective_provider_views()
         try:
             chain = self.audit.verify()
             audit_view = {"records": chain["records"], "chain_intact": chain["intact"],
@@ -77,12 +110,13 @@ class MiddlewareApp:
             "version": __version__,
             "env": self.settings.env,
             "providers": providers,
+            "providers_config": (managed_meta(self.provider_store)
+                                 if self.provider_store is not None else {}),
             "policy": self.settings.public_policy(),
             "auth": {
                 "client_keys": self.clients.count(),
                 "anonymous_allowed": self.settings.allow_anonymous,
                 "admin_configured": self.admin.configured,
-                "readonly_admin_configured": self.admin.readonly_configured,
             },
             "audit": audit_view,
             "vault": self.token_vault.stats(),
@@ -125,7 +159,13 @@ def build_middleware(data_dir: Path | None = None, *, settings: Settings | None 
     data_dir = Path(data_dir or default_data_dir())
     vault = vault or Vault.load_or_init(data_dir)
 
-    registry = build_registry(settings, transports=transports)
+    base_settings = settings
+    provider_store = ManagedProviderStore(data_dir, vault,
+                                          production=base_settings.production)
+    settings, provider_keys = compose_settings_with_store(base_settings, provider_store)
+    enforce_effective_providers(settings)
+    registry = build_registry(settings, transports=transports,
+                              key_overrides=provider_keys)
     keyring = KeyRing.from_vault(vault)
     token_vault = TokenVault(vault, ttl_s=settings.vault_ttl_s,
                              max_requests=settings.vault_max_requests,
@@ -135,8 +175,7 @@ def build_middleware(data_dir: Path | None = None, *, settings: Settings | None 
     confirmations = ConfirmationStore(ttl_s=settings.confirm_ttl_s,
                                       max_records=settings.confirm_max_records)
     clients = ClientKeyStore.build(data_dir, vault)
-    admin = AdminAuthenticator(settings.admin_token, production=settings.production,
-                               readonly_token=settings.admin_readonly_token)
+    admin = AdminAuthenticator(settings.admin_token, production=settings.production)
     detector = DetectorConfig.load(settings.detection_config_path)
     metrics = Metrics()
     idempotency = IdempotencyStore(
@@ -153,9 +192,12 @@ def build_middleware(data_dir: Path | None = None, *, settings: Settings | None 
         concurrency=ConcurrencyGuard(settings.max_concurrency),
         pipeline=pipeline, detector=detector, metrics=metrics,
         idempotency=idempotency,
+        base_settings=base_settings, provider_store=provider_store,
+        transports=dict(transports or {}),
     )
     app.bootstrap_key = _bootstrap_client(app)
-    for warning in _startup_warnings(settings, registry):
+    for warning in _startup_warnings(settings, registry, provider_store,
+                                     base_settings):
         logger.warning("startup: %s", warning)
     return app
 
@@ -211,19 +253,29 @@ def _bootstrap_client(app: MiddlewareApp) -> str:
     return plaintext
 
 
-def _startup_warnings(settings: Settings, registry: ProviderRegistry) -> list[str]:
+def _startup_warnings(settings: Settings, registry: ProviderRegistry,
+                      store: ManagedProviderStore | None = None,
+                      base_settings: Settings | None = None) -> list[str]:
     """启动期安全提示(不影响可用性,但必须说清楚)。"""
     warnings: list[str] = []
     if settings.allow_anonymous:
         warnings.append(
             "CG_ALLOW_ANONYMOUS=1:未认证请求会消耗上游额度,仅限本机调试使用")
-    for view in _provider_views(settings, registry):
+    if store is not None:
+        env_names = {p.name for p in (base_settings or settings).providers}
+        views = provider_views(settings, registry, store, env_names)
+    else:
+        views = _provider_views(settings, registry)
+    for view in views:
         if view["type"] != "mock" and not view["has_key"]:
-            source = f"环境变量 {view.get('key_env') or '<未指定 api_key_env>'}"
+            if view.get("source") == "managed":
+                source = "控制台托管配置未设置 API Key"
+            else:
+                source = f"环境变量 {view.get('key_env') or '<未指定 api_key_env>'}"
             warnings.append(
                 f"提供商 {view['name']} 未配置密钥({source}):"
                 "调用该提供商会 fail-closed 报错")
-    for view in _provider_views(settings, registry):
+    for view in views:
         if view.get("trust_env"):
             warnings.append(
                 f"提供商 {view['name']} 开启了 trust_env:上游请求可能经环境/系统代理,"
@@ -248,8 +300,6 @@ def _startup_warnings(settings: Settings, registry: ProviderRegistry) -> list[st
         warnings.append("CG_DOCUMENT_POLICY=pass:文档内容不经过检测,属于显式接受的未保护面")
     if settings.metrics_public:
         warnings.append("CG_METRICS_PUBLIC=1:/metrics 可匿名访问,仅限受信网络")
-    if settings.admin_readonly_token:
-        warnings.append("已启用只读管理员令牌:GET/指标/审计校验可用,写操作仍要求全权令牌")
     if not settings.instance_lock:
         warnings.append("CG_INSTANCE_LOCK=0:已关闭单实例锁,确认/金库/限流/审计不再有进程互斥")
     return warnings

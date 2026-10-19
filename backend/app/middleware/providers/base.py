@@ -25,8 +25,9 @@ from ..errors import MiddlewareError
 class ProviderConfig:
     """一个已装配好的提供商(密钥已解析到内存)。
 
-    密钥只来自 `api_key_env` 指向的环境变量,启动期读入 `api_key`;只存在于内存,
-    绝不序列化/日志/回显。改钥需重启进程（这是有意的：少一条运行时密钥路径）。
+    密钥来自 `api_key_env` 指向的环境变量，或控制台托管配置（见
+    middleware/provider_config.py）；只在内存中解密，绝不序列化/日志/回显。
+    环境变量密钥改后需重启；控制台托管配置保存后热生效。
     """
 
     name: str
@@ -35,6 +36,8 @@ class ProviderConfig:
     api_key: str = ""              # 仅内存;绝不序列化/日志
     #: 密钥来自哪个环境变量(仅变量名,不是密钥本身;供排错与 health 展示)
     api_key_env: str = ""
+    #: 密钥来源:managed(控制台托管、加密落盘) | env(环境变量/.env) | none
+    key_source: str = "env"
     models: tuple[str, ...] = ()
     display_name: str = ""
     timeout_connect: float = 10.0
@@ -162,8 +165,11 @@ class ModelProvider(abc.ABC):
         if not self.config.base_url:
             missing.append("base_url")
         if not self.config.resolved_api_key:
-            missing.append(
-                f"密钥(环境变量 {self.config.api_key_env or '<未指定 api_key_env>'})")
+            if self.config.key_source == "managed":
+                missing.append("密钥(控制台托管配置缺少 API Key)")
+            else:
+                missing.append(
+                    f"密钥(环境变量 {self.config.api_key_env or '<未指定 api_key_env>'})")
         raise MiddlewareError(
             "config",
             f"提供商 {self.name!r} 未配置完整,缺少 " + "、".join(missing) + ",已拒绝调用上游")
@@ -199,6 +205,7 @@ class ModelProvider(abc.ABC):
             "base_url": self.config.base_url,
             "configured": self.config.configured,
             "has_key": bool(self.config.resolved_api_key) or self.config.type == "mock",
+            "key_source": self.config.key_source,
             "key_env": self.config.api_key_env,
             "trust_env": self.config.trust_env,
             "models": list(self.models),

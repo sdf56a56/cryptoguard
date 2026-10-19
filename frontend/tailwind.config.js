@@ -4,54 +4,39 @@ export default {
   theme: {
     extend: {
       colors: {
-        // 浅色「加密账本」主题
-        paper: '#faf9f6',
+        canvas: '#f5f6f8',
         surface: '#ffffff',
         ink: {
-          DEFAULT: '#182235',   // 主文字（深墨蓝）
-          soft: '#4b5568',      // 次级文字
-          faint: '#8b92a5',     // 弱文字
+          DEFAULT: '#0f172a',
+          soft: '#475569',
+          faint: '#8b95a5',
         },
         line: {
-          DEFAULT: '#e6e2da',   // 暖灰描边
-          strong: '#cfc9be',
+          DEFAULT: '#e4e8ee',
+          strong: '#cbd5e1',
         },
-        vault: {
-          50: '#eef2ff',
-          100: '#e0e7ff',
-          200: '#c7d2fe',
-          500: '#4361ee',       // 主色：信号蓝
-          600: '#3451d1',
-          700: '#2840a8',
-          800: '#1f3280',
+        accent: {
+          50: '#eef4ff',
+          100: '#dbe7ff',
+          200: '#bfd3fe',
+          500: '#2563eb',
+          600: '#1d4ed8',
+          700: '#1e40af',
         },
-        ok: {
-          DEFAULT: '#0ca678',
-          soft: '#e3f8f1',
-        },
-        bad: {
-          DEFAULT: '#e03131',
-          soft: '#fdeaea',
-        },
-        warn: {
-          DEFAULT: '#e8890c',
-          soft: '#fdf1de',
-        },
-        crypto: {
-          violet: '#7048e8',
-          violetSoft: '#f0ecfe',
-          teal: '#0d9488',
-        },
+        ok: { DEFAULT: '#15803d', soft: '#f0fdf4' },
+        bad: { DEFAULT: '#b91c1c', soft: '#fef2f2' },
+        warn: { DEFAULT: '#b45309', soft: '#fffbeb' },
       },
       fontFamily: {
-        display: ['Epilogue', 'Noto Sans SC', 'sans-serif'],
-        sans: ['Noto Sans SC', 'Epilogue', 'sans-serif'],
-        mono: ['IBM Plex Mono', 'ui-monospace', 'monospace'],
+        sans: ['-apple-system', 'BlinkMacSystemFont', '"Segoe UI"',
+               '"Noto Sans SC"', '"PingFang SC"', '"Microsoft YaHei"',
+               'sans-serif'],
+        mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas',
+               '"Liberation Mono"', 'monospace'],
       },
       boxShadow: {
-        card: '0 1px 2px rgba(24,34,53,0.04), 0 8px 24px -12px rgba(24,34,53,0.10)',
-        lift: '0 2px 4px rgba(24,34,53,0.05), 0 16px 40px -16px rgba(24,34,53,0.16)',
-        stamp: '0 4px 12px -4px rgba(12,166,120,0.35)',
+        card: '0 1px 2px rgba(15, 23, 42, 0.03)',
+        pop: '0 12px 32px -12px rgba(15, 23, 42, 0.22)',
       },
     },
   },

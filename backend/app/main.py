@@ -94,6 +94,7 @@ async def _lifespan(app: FastAPI):
 
     try:
         app.state.middleware = build_middleware(default_data_dir(), settings=settings)
+        app.state.middleware_error = ""
         try:
             import anyio
 
@@ -108,6 +109,7 @@ async def _lifespan(app: FastAPI):
             if lock is not None:
                 lock.release()
             raise
+        app.state.middleware_error = str(exc.detail)
         logger.critical(
             "网关装配失败，/v1/* 与 /admin/* 将返回 503（修复配置后重启）: %s",
             exc.detail)
@@ -121,7 +123,7 @@ async def _lifespan(app: FastAPI):
     finally:
         middleware = getattr(app.state, "middleware", None)
         if middleware is not None:
-            middleware.registry.close()
+            middleware.close()
         lock = getattr(app.state, "instance_lock", None)
         if lock is not None:
             lock.release()

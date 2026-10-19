@@ -43,7 +43,6 @@ Agent / SDK ──▶ CryptoGuard ──▶ Provider ──▶ CryptoGuard ─�
 | `VAULT_KEY` | 无（首次启动生成） | 64 位十六进制信任根；所有子密钥由 HKDF 派生 |
 | `CG_ENV` | `development` | `production` 时强制管理员令牌、禁匿名、禁示例密钥 |
 | `CG_ADMIN_TOKEN` | 空 | 管理接口全权令牌；空 = 503 |
-| `CG_ADMIN_READONLY_TOKEN` | 空 | 只读管理员：GET/指标/审计校验可用，写操作 403 |
 | `CG_DATA_DIR` | 空 | 覆盖数据目录（默认仓库根 `data/`） |
 | `CG_INSTANCE_LOCK` | `1` | 同 `data/` 目录只允许一个进程 |
 | `CG_CORS_ORIGINS` | 空 | 浏览器 CORS 白名单；空 = 不挂；生产禁 `*` |
@@ -67,6 +66,24 @@ Agent / SDK ──▶ CryptoGuard ──▶ Provider ──▶ CryptoGuard ─�
 
 **客户端密钥与上游密钥严格分离**：客户端密钥只用于网关认证；上游密钥只随出网
 请求发往 provider；两者互不出现在对方的可见面。
+
+### 3.1 运行时 Provider 配置（控制台托管）
+
+除了 `CG_PROVIDERS`，管理员可以在控制台「上游配置」里新增/编辑/删除 Provider，
+保存后**立即生效，无需重启**：
+
+- 托管配置整体用 AES-256-GCM 加密落盘：`<data_dir>/config/provider-config.enc.json`
+  （目录 0700、文件 0600、原子替换）；密钥由 `VAULT_KEY` 经 HKDF 派生
+  （用途域 `provider-config/v1`）；
+- 接口只返回 `has_key` / `key_source` / `key_env` 等非敏感字段，**永不回显**
+  API Key 或 `extra_headers` 的值；审计只记字段名与 `key_updated` 布尔值；
+- 同名托管项**覆盖**环境变量项；删除托管项后环境变量项恢复；
+- 默认 Provider / 模型可以指向环境变量项或托管项；非法默认值返回 400；
+- 热切换只影响新请求；在途请求继续使用旧 registry，旧连接池在进程退出时关闭；
+- `VAULT_KEY` 变更会导致托管配置无法解密：启动 fail-closed，需恢复原 `VAULT_KEY`
+  或移走配置文件后重新配置；
+- 管理面可把上游指向任意 http(s) 地址，这是管理员权限的一部分；控制台会提示只填
+  可信上游。
 
 ## 4. 人工确认（高风险数据的受控释放）
 
@@ -105,11 +122,12 @@ OpenAI Chat 额外接受 `reasoning_effort` / `verbosity` 并透传给 openai-co
 | 接口 | 权限 | 作用 |
 |---|---|---|
 | `POST /v1/verify` | 客户端（只能查自己的 request_id） | 记录存在性 / 摘要一致性 / 记录 MAC / 审计链 |
-| `GET /admin/audit` | 管理员/只读管理员 | 分页 |
-| `POST /admin/audit/verify` | 管理员/只读管理员 | 整链校验 |
-| `POST /admin/audit/purge` | 全权管理员 | 按保留期清理（默认 dry-run） |
+| `GET /admin/audit` | 管理员 | 分页 |
+| `POST /admin/audit/verify` | 管理员 | 整链校验 |
+| `POST /admin/audit/purge` | 管理员 | 按保留期清理（默认 dry-run） |
+| `GET /admin/dashboard` | 管理员 | 看板快照（只读内存计数，不做整链校验） |
 | `GET /ready` | 公开 | 装配/provider/审计链就绪 |
-| `GET /metrics` | 管理员/只读管理员（或 `CG_METRICS_PUBLIC=1`） | Prometheus 文本 |
+| `GET /metrics` | 管理员（或 `CG_METRICS_PUBLIC=1`） | Prometheus 文本 |
 
 **必须区分的三个结论**：记录完整性、响应摘要匹配、敏感数据保护成功。任何一件
 成立都不蕴含另一件。审计记录不含原始 Prompt、原始敏感值、密钥或可还原映射。
@@ -143,7 +161,7 @@ backend/app/
     ├── pipeline.py         # 检测→保护→转发→还原→审计
     ├── config.py           # CG_* 解析与生产校验
     ├── errors.py           # 错误分类 / 脱敏 / 协议错误体
-    ├── auth.py             # 客户端密钥 + 管理员/只读管理员
+    ├── auth.py             # 客户端密钥 + 单用户全权管理员
     ├── ratelimit.py        # 滑动窗口 + 并发闸
     ├── protection.py       # A/B/C 三模式 + TokenVault
     ├── restore.py          # 受控还原 + 流式持留
@@ -154,7 +172,8 @@ backend/app/
     ├── audit.py            # 封缄审计 + 链
     ├── verification.py     # 摘要 / MAC / 链哈希
     ├── idempotency.py      # 幂等键缓存
-    ├── metrics.py          # Prometheus 指标 + ASGI 包装
+    ├── metrics.py          # Prometheus 指标 + 看板 JSON 快照 + ASGI 包装
+    ├── provider_config.py  # 托管 Provider：加密落盘 / 校验 / 热生效
     ├── instance.py         # 单实例锁
     ├── responses_proto.py  # Responses ⇄ 中立协议
     ├── openai_schemas.py   # OpenAI/Anthropic 入口模型

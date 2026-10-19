@@ -23,8 +23,12 @@ HTTP 入口 —— /health、/v1/*、/admin/*
   POST /admin/clients/{id}/revoke  撤销(管理员)
   POST /admin/clients/{id}/rotate  轮换(管理员;明文只回一次)
   PATCH /admin/clients/{id}        更新客户端配置(管理员)
-  GET  /admin/providers            提供商视图(管理员/只读管理员)
+  GET  /admin/providers            提供商视图(管理员)
   POST /admin/providers/{name}/test 上游连通性测试(管理员)
+  GET  /admin/dashboard            控制台看板快照(管理员;只读内存计数)
+  POST /admin/providers            控制台托管 Provider 新增(热生效)
+  PATCH/DELETE /admin/providers/{name} 更新/删除托管 Provider
+  PUT  /admin/provider-defaults    设置默认 Provider/模型
 
 安全约束(实现即按此执行):
   - 鉴权先于限流,限流先于上游调用:未认证请求不可能消耗上游额度
@@ -53,13 +57,15 @@ from . import anthropic_proto, responses_proto
 from .auth import ClientKey
 from .confirmations import resolve_confirmation, validate_requested_tokens
 from .content_policy import check_anthropic_request, check_openai_request
-from .deps import MiddlewareApp
+from .deps import MiddlewareApp, __version__
 from .errors import MiddlewareError
 from .openai_schemas import (AnthropicMessagesRequest, ChatCompletionRequest,
                              ConfirmationCreateRequest, CryptoGuardDirectiveIn,
                              VerifyRequest, validation_error)
+from .metrics import aggregate_histograms, histogram_quantile
 from .pipeline import RequestContext
 from .policy import resolve_policy
+from .provider_config import apply_candidate, managed_meta
 from .providers.base import StreamChunk
 from .verification import load_digest_spec, recompute_response_digest
 
@@ -205,9 +211,9 @@ def _require_client(request: Request, app: MiddlewareApp) -> ClientKey | None:
         "或使用请求头 x-api-key(本部署未开启匿名调用)")
 
 
-def _require_admin(request: Request, app: MiddlewareApp, *, write: bool = True) -> str:
-    """校验管理员令牌；`write=False` 允许只读管理员（GET 类查询/指标/审计校验）。"""
-    return app.admin.require(request.headers.get("x-admin-token"), write=write)
+def _require_admin(request: Request, app: MiddlewareApp) -> str:
+    """校验管理员令牌（单用户、全权；不存在只读角色）。"""
+    return app.admin.require(request.headers.get("x-admin-token"))
 
 
 def _limit_key(request: Request, client: ClientKey | None) -> str:
@@ -365,9 +371,11 @@ def _check_model_allowed(client: ClientKey | None, model: str) -> None:
 def health(request: Request) -> Response:
     app: MiddlewareApp | None = getattr(request.app.state, "middleware", None)
     if app is None:
+        startup_error = str(getattr(request.app.state, "middleware_error", "") or "")
         return JSONResponse(status_code=503, content={
             "status": "unavailable",
-            "detail": "中间件未装配(见启动日志;CG_NO_BOOT=1 时 /v1/* 不可用)",
+            "detail": startup_error or
+                      "中间件未装配(见启动日志;CG_NO_BOOT=1 时 /v1/* 不可用)",
         })
     return JSONResponse(content=app.health())
 
@@ -403,12 +411,12 @@ def ready(request: Request) -> Response:
 
 @router.get("/metrics")
 def metrics(request: Request) -> Response:
-    """Prometheus 文本指标；默认需要管理员/只读管理员令牌。"""
+    """Prometheus 文本指标；默认需要管理员令牌。"""
     app: MiddlewareApp | None = None
     try:
         app = _app(request)
         if not app.settings.metrics_public:
-            _require_admin(request, app, write=False)
+            _require_admin(request, app)
     except MiddlewareError as exc:
         return _fail(exc, app=app)
     return Response(content=app.metrics.render(),
@@ -992,7 +1000,7 @@ async def verify(request: Request) -> Response:
             raise validation_error(exc) from None
         admin = False
         if request.headers.get("x-admin-token"):
-            _require_admin(request, app, write=False)
+            _require_admin(request, app)
             admin = True
         record = app.audit.get(body.request_id)
     except MiddlewareError as exc:
@@ -1233,7 +1241,7 @@ def admin_confirmations(request: Request, status: str = "", client_id: str = "",
     app: MiddlewareApp | None = None
     try:
         app = _app(request)
-        _require_admin(request, app, write=False)
+        _require_admin(request, app)
         return JSONResponse(content={
             "object": "list",
             "data": app.confirmations.list(client_id=client_id, status=status,
@@ -1308,14 +1316,16 @@ def admin_policies(request: Request) -> Response:
     app: MiddlewareApp | None = None
     try:
         app = _app(request)
-        _require_admin(request, app, write=False)
+        _require_admin(request, app)
     except MiddlewareError as exc:
         return _fail(exc, app=app)
     from .recognizers import EXTENDED_RULES, REVIEW_THRESHOLD
     detector = app.detector
     return JSONResponse(content={
         "policy": app.settings.public_policy(),
-        "providers": app.settings.provider_public_view(),
+        "providers": app.effective_provider_views(),
+        "providers_config": (managed_meta(app.provider_store)
+                            if app.provider_store is not None else {}),
         "models": app.registry.list_model_ids(),
         "deployment": {
             "mode": "single-process",
@@ -1355,13 +1365,169 @@ def admin_policies(request: Request) -> Response:
     })
 
 
+# --------------------------------------------------------------------------- #
+# 控制台看板：一次请求返回全部实时计数（只读内存，不做整链校验）
+# --------------------------------------------------------------------------- #
+def _group_counter(counters: list[dict], name: str, field: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for item in counters:
+        if item.get("name") != name:
+            continue
+        key = str((item.get("labels") or {}).get(field) or "")
+        if not key:
+            continue
+        out[key] = out.get(key, 0) + int(float(item.get("value") or 0))
+    return out
+
+
+def _dashboard_payload(app: MiddlewareApp) -> dict:
+    snapshot = app.metrics.snapshot()
+    counters = snapshot.get("counters") or []
+    # 看板只统计业务入口 /v1/*：把控制台自身（/admin/*、/health、/metrics）的
+    # 轮询从「总请求 / 延迟 / 错误率」里剔除，否则看板会把轮询次数当成中转流量。
+    def _is_v1(labels: dict | None) -> bool:
+        return str((labels or {}).get("path") or "").startswith("/v1/")
+
+    requests = [item for item in counters
+                if item.get("name") == "requests_total" and _is_v1(item.get("labels"))]
+    by_status: dict[str, int] = {}
+    by_path: list[dict] = []
+    for item in requests:
+        labels = item.get("labels") or {}
+        status = str(labels.get("status") or "")
+        count = int(float(item.get("value") or 0))
+        by_status[status] = by_status.get(status, 0) + count
+        by_path.append({"path": str(labels.get("path") or ""),
+                        "method": str(labels.get("method") or ""),
+                        "status": status, "count": count})
+    by_path.sort(key=lambda row: (-row["count"], row["path"], row["status"]))
+    total = sum(by_status.values())
+    errors = sum(value for status, value in by_status.items()
+                 if status.isdigit() and int(status) >= 400)
+
+    histogram = aggregate_histograms(
+        [item for item in (snapshot.get("histograms") or [])
+         if item.get("name") == "request_duration_seconds"
+         and _is_v1(item.get("labels"))],
+        "request_duration_seconds")
+    if histogram:
+        quantiles = {
+            "count": histogram["count"],
+            "sum_s": round(histogram["sum"], 4),
+            "p50_ms": round(histogram_quantile(histogram["bounds"],
+                                               histogram["counts"], 0.50) * 1000, 1),
+            "p95_ms": round(histogram_quantile(histogram["bounds"],
+                                               histogram["counts"], 0.95) * 1000, 1),
+            "p99_ms": round(histogram_quantile(histogram["bounds"],
+                                               histogram["counts"], 0.99) * 1000, 1),
+        }
+    else:
+        quantiles = {"count": 0, "sum_s": 0.0, "p50_ms": 0.0,
+                     "p95_ms": 0.0, "p99_ms": 0.0}
+
+    detections = _group_counter(counters, "detections_total", "type")
+    blocked = _group_counter(counters, "blocked_total", "type")
+    restored = _group_counter(counters, "tokens_restored_total", "type")
+    upstream_by_provider = _group_counter(counters, "upstream_requests_total", "provider")
+    upstream_by_outcome = _group_counter(counters, "upstream_requests_total", "outcome")
+    upstream_by_error = {key: value for key, value in _group_counter(
+        counters, "upstream_requests_total", "error_kind").items()
+        if key not in ("", "none")}
+
+    try:
+        audit_head = {
+            "records": app.audit.count(),
+            "tip_seq": app.audit.tip()["seq"],
+            "tip_hash": app.audit.tip()["chain_hash"],
+            "anchor": app.audit.tip().get("anchor") or "",
+        }
+    except Exception as exc:  # noqa: BLE001 — 看板不能因审计读取失败而 500
+        logger.warning("dashboard_audit_head_failed: %s", type(exc).__name__)
+        audit_head = {"records": 0, "tip_seq": 0, "tip_hash": "", "anchor": "",
+                      "error": type(exc).__name__}
+
+    providers = app.effective_provider_views()
+    settings = app.settings
+    return {
+        "generated_at": time.time(),
+        "uptime_s": round(float(snapshot.get("uptime_s") or 0.0), 1),
+        "service": {"version": __version__, "env": settings.env,
+                    "policy_version": settings.policy_version},
+        "deployment": {"mode": "single-process",
+                       "instance_lock": bool(settings.instance_lock),
+                       "note": "确认/金库/限流/审计为进程内状态；不支持多 worker/多副本"},
+        "requests": {"total": total, "errors": errors,
+                     "error_rate": round(errors / total, 4) if total else 0.0,
+                     "by_status": by_status, "by_path": by_path},
+        "durations": quantiles,
+        "detections": {"total": sum(detections.values()), "by_type": detections},
+        "blocked": {"total": sum(blocked.values()), "by_type": blocked},
+        "restored": {"total": sum(restored.values()), "by_type": restored},
+        "upstream": {"total": sum(upstream_by_provider.values()),
+                     "by_provider": upstream_by_provider,
+                     "by_outcome": upstream_by_outcome,
+                     "by_error_kind": upstream_by_error},
+        "confirmations": app.confirmations.stats(),
+        "vault": app.token_vault.stats(),
+        "idempotency": (app.idempotency.stats()
+                        if app.idempotency is not None else {}),
+        "audit": audit_head,
+        "clients": {"total": app.clients.count()},
+        "providers": providers,
+        "defaults": {"provider": app.registry.default_provider,
+                     "model": app.registry.default_model},
+        "policy": {
+            "protection_mode": settings.protection_mode,
+            "restore_mode": settings.restore_mode,
+            "restore_categories": list(settings.restore_categories),
+            "block_on": settings.block_on,
+            "image_policy": settings.image_policy,
+            "document_policy": settings.document_policy,
+            "anthropic_thinking": settings.anthropic_thinking,
+            "cache_control": settings.cache_control,
+            "rate_limit_per_min": settings.rate_limit_per_min,
+            "max_concurrency": settings.max_concurrency,
+            "max_request_bytes": settings.max_request_bytes,
+        },
+        "misc": {
+            "sse_heartbeats_total": sum(
+                int(float(c.get("value") or 0)) for c in counters
+                if c.get("name") == "sse_heartbeats_total"),
+            "idempotent_replays_total": sum(
+                int(float(c.get("value") or 0)) for c in counters
+                if c.get("name") == "idempotent_replays_total"),
+        },
+        "checks": {
+            "providers": any(bool(view.get("configured")) for view in providers),
+            "instance_lock": bool(settings.instance_lock),
+        },
+    }
+
+
+@router.get("/admin/dashboard")
+def admin_dashboard(request: Request) -> Response:
+    """控制台实时看板快照（单用户全权管理员；只读内存计数）。"""
+    app: MiddlewareApp | None = None
+    try:
+        app = _app(request)
+        _require_admin(request, app)
+    except MiddlewareError as exc:
+        return _fail(exc, app=app)
+    try:
+        return JSONResponse(content=_dashboard_payload(app))
+    except Exception as exc:  # noqa: BLE001 — 不把栈透给客户端
+        logger.exception("dashboard_failed")
+        return _fail(MiddlewareError(
+            "internal", f"看板数据生成失败: {type(exc).__name__}"), app=app)
+
+
 @router.get("/admin/audit")
 def admin_audit(request: Request, limit: int = 50, offset: int = 0,
                 client_id: str = "", outcome: str = "", since: float = 0.0) -> Response:
     app: MiddlewareApp | None = None
     try:
         app = _app(request)
-        _require_admin(request, app, write=False)
+        _require_admin(request, app)
     except MiddlewareError as exc:
         return _fail(exc, app=app)
     page = app.audit.list(limit=limit, offset=offset, client_id=client_id,
@@ -1379,7 +1545,7 @@ def admin_audit_one(request: Request, request_id: str) -> Response:
     app: MiddlewareApp | None = None
     try:
         app = _app(request)
-        _require_admin(request, app, write=False)
+        _require_admin(request, app)
     except MiddlewareError as exc:
         return _fail(exc, app=app)
     record = app.audit.get(request_id)
@@ -1395,7 +1561,7 @@ def admin_audit_verify(request: Request, full: bool = True) -> Response:
     app: MiddlewareApp | None = None
     try:
         app = _app(request)
-        _require_admin(request, app, write=False)
+        _require_admin(request, app)
         result = app.audit.verify(full=full)
     except MiddlewareError as exc:
         return _fail(exc, app=app)
@@ -1424,7 +1590,7 @@ def admin_clients(request: Request) -> Response:
     app: MiddlewareApp | None = None
     try:
         app = _app(request)
-        _require_admin(request, app, write=False)
+        _require_admin(request, app)
     except MiddlewareError as exc:
         return _fail(exc, app=app)
     return JSONResponse(content={
@@ -1558,21 +1724,149 @@ def admin_rotate_client(request: Request, client_id: str) -> Response:
 # --------------------------------------------------------------------------- #
 # 上游提供商视图与连通性测试（管理面；绝不回显密钥或上游正文）
 # --------------------------------------------------------------------------- #
+def _providers_payload(app: MiddlewareApp) -> dict:
+    """Provider 视图（绝不包含密钥值/header 值/上游正文）。"""
+    return {
+        "providers": app.effective_provider_views(),
+        "default_provider": app.registry.default_provider,
+        "default_model": app.registry.default_model,
+        "allow_unknown_models": bool(app.settings.allow_unknown_models),
+        "models": app.registry.list_model_ids(),
+        "managed": (managed_meta(app.provider_store)
+                    if app.provider_store is not None else {}),
+        "note": "只返回密钥来源与是否已配置；密钥值与 extra_headers 值永不回显",
+    }
+
+
+def _audit_provider_change(app: MiddlewareApp, operation: str, name: str, *,
+                           changed_fields: list[str] | None = None,
+                           key_updated: bool = False) -> None:
+    """控制面审计：只记字段名与布尔值，绝不记密钥/header 值。"""
+    ctx = RequestContext(endpoint="/admin/providers")
+    app.pipeline.audit_event(ctx, outcome="provider_config", actions={
+        "operation": operation,
+        "provider": name,
+        "changed_fields": sorted(changed_fields or []),
+        "key_updated": bool(key_updated),
+        "default_provider": app.registry.default_provider,
+        "default_model": app.registry.default_model,
+    })
+
+
+def _require_provider_store(app: MiddlewareApp):
+    if app.provider_store is None:
+        raise MiddlewareError("config", "托管 Provider 配置未装配（控制台不可用）")
+    return app.provider_store
+
+
 @router.get("/admin/providers")
 def admin_providers(request: Request) -> Response:
     app: MiddlewareApp | None = None
     try:
         app = _app(request)
-        _require_admin(request, app, write=False)
+        _require_admin(request, app)
     except MiddlewareError as exc:
         return _fail(exc, app=app)
-    return JSONResponse(content={
-        "providers": _provider_health(app),
-        "default_provider": app.settings.default_provider,
-        "default_model": app.settings.default_model,
-        "allow_unknown_models": app.settings.allow_unknown_models,
-        "note": "只返回密钥环境变量名与是否已配置；不返回密钥本体或上游正文",
-    })
+    return JSONResponse(content=_providers_payload(app))
+
+
+@router.post("/admin/providers")
+async def admin_create_provider(request: Request) -> Response:
+    """新增控制台托管的 Provider；保存后立即生效（无需重启）。"""
+    app: MiddlewareApp | None = None
+    try:
+        app = _app(request)
+        _require_admin(request, app)
+        store = _require_provider_store(app)
+        raw = await _read_json(request)
+        name = str(raw.get("name") or "").strip()
+        with app.provider_lock:
+            candidate = store.candidate_upsert(raw, name=name, create=True)
+            _settings, views = apply_candidate(app, candidate)
+        _audit_provider_change(
+            app, "create", name,
+            changed_fields=[k for k in raw if k not in ("api_key", "clear_api_key")],
+            key_updated=bool(str(raw.get("api_key") or "").strip()))
+        payload = _providers_payload(app)
+        payload.update({
+            "provider": next((v for v in views if v["name"] == name), None),
+            "applied": True,
+        })
+        return JSONResponse(status_code=201, content=payload)
+    except MiddlewareError as exc:
+        return _fail(exc, app=app)
+
+
+@router.patch("/admin/providers/{name}")
+async def admin_update_provider(request: Request, name: str) -> Response:
+    """更新托管 Provider；环境变量独有项不可改（可新建同名托管项覆盖）。"""
+    app: MiddlewareApp | None = None
+    try:
+        app = _app(request)
+        _require_admin(request, app)
+        store = _require_provider_store(app)
+        raw = await _read_json(request)
+        if raw.get("name") and str(raw.get("name")) != name:
+            raise MiddlewareError("invalid_request", "Provider 名称不可修改")
+        with app.provider_lock:
+            candidate = store.candidate_upsert(raw, name=name, create=False)
+            _settings, views = apply_candidate(app, candidate)
+        _audit_provider_change(
+            app, "update", name,
+            changed_fields=[k for k in raw if k not in ("api_key", "clear_api_key")],
+            key_updated=bool(str(raw.get("api_key") or "").strip())
+                        or bool(raw.get("clear_api_key")))
+        payload = _providers_payload(app)
+        payload.update({
+            "provider": next((v for v in views if v["name"] == name), None),
+            "applied": True,
+        })
+        return JSONResponse(content=payload)
+    except MiddlewareError as exc:
+        return _fail(exc, app=app)
+
+
+@router.delete("/admin/providers/{name}")
+def admin_delete_provider(request: Request, name: str) -> Response:
+    """删除托管 Provider；同名环境变量项会重新生效。"""
+    app: MiddlewareApp | None = None
+    try:
+        app = _app(request)
+        _require_admin(request, app)
+        store = _require_provider_store(app)
+        with app.provider_lock:
+            candidate = store.candidate_delete(name)
+            _settings, views = apply_candidate(app, candidate)
+        _audit_provider_change(app, "delete", name)
+        payload = _providers_payload(app)
+        payload.update({"deleted": name, "applied": True})
+        return JSONResponse(content=payload)
+    except MiddlewareError as exc:
+        return _fail(exc, app=app)
+
+
+@router.put("/admin/provider-defaults")
+async def admin_provider_defaults(request: Request) -> Response:
+    """设置默认 Provider/模型；保存后立即生效。"""
+    app: MiddlewareApp | None = None
+    try:
+        app = _app(request)
+        _require_admin(request, app)
+        store = _require_provider_store(app)
+        raw = await _read_json(request)
+        provider = str(raw.get("default_provider") or "").strip()
+        model = str(raw.get("default_model") or "").strip()
+        with app.provider_lock:
+            candidate = store.candidate_defaults(provider, model)
+            _settings, views = apply_candidate(app, candidate)
+        _audit_provider_change(
+            app, "defaults", provider,
+            changed_fields=["default_provider", "default_model"])
+        payload = _providers_payload(app)
+        payload.update({"applied": True})
+        return JSONResponse(content=payload)
+    except MiddlewareError as exc:
+        return _fail(exc, app=app)
 
 
 @router.post("/admin/providers/{name}/test")

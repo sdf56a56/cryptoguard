@@ -2,11 +2,12 @@
 中间件集中配置 —— 环境变量(CG_*)+ backend/.env,启动期一次校验
 
 安全目标:
-  - 密钥只从环境变量 / .env 读取,永不写进源码、镜像或 Git 跟踪文件;
+  - 环境变量 / .env 里的上游密钥永不写进源码、镜像或 Git 跟踪文件;
+    控制台托管的上游密钥另由 provider_config.py 加密落盘;
   - 生产环境(CG_ENV=production)硬约束:必须设 CG_ADMIN_TOKEN 且禁止匿名调用
     (CG_ALLOW_ANONYMOUS 必须为 0),否则启动失败(fail-closed);
-  - 上游密钥与客户端密钥严格分离:上游密钥在 ProviderSettings.api_key_env 指向的
-    环境变量里,客户端密钥的校验材料只存 HMAC 摘要(见 auth.py)。
+  - 上游密钥与客户端密钥严格分离:上游密钥来自环境变量或控制台托管配置,
+    客户端密钥的校验材料只存 HMAC 摘要(见 auth.py)。
 
 明确不承诺:
   - 不承诺保护已失窃的 .env / 进程环境(本地信任边界,同 keys.py);
@@ -75,10 +76,26 @@ class ProviderSettings:
     token_limit_field: str = "max_tokens"
 
     def api_key(self) -> str:
-        """当前进程环境里的上游密钥(空串 = 未配置)。"""
-        if not self.api_key_env:
-            return ""
-        return (os.environ.get(self.api_key_env, "") or "").strip()
+        """当前生效的上游密钥(空串 = 未配置)。
+
+        读取顺序:进程环境变量 → `backend/.env`。两者都没有时返回空串。
+        这样 `.env` 里声明的 `api_key_env` 才会真正生效(与文档口径一致)。
+        """
+        return provider_api_key(self.api_key_env)
+
+
+def provider_api_key(env_name: str) -> str:
+    """按变量名解析上游密钥:os.environ 优先,backend/.env 兜底。
+
+    只返回密钥值本身,不记录、不回显。调用方绝不应把返回值写日志。
+    """
+    name = (env_name or "").strip()
+    if not name:
+        return ""
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = _load_env_file(_ENV_PATH_DEFAULT).get(name, "")
+    return (raw or "").strip()
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -152,6 +169,10 @@ def _validate_base_url(raw: str, provider: str) -> str:
         raise ConfigError(f"提供商 {provider!r} 的 base_url 缺少主机名")
     if parsed.query or parsed.fragment:
         raise ConfigError(f"提供商 {provider!r} 的 base_url 不应含查询串或片段")
+    if parsed.username or parsed.password:
+        raise ConfigError(
+            f"提供商 {provider!r} 的 base_url 不能包含用户名/密码"
+            "（凭据请使用 API Key / extra_headers）")
     return url
 
 
@@ -271,7 +292,6 @@ class Settings:
     stream_buffer_chars: int = 128
     #: 响应侧敏感检测:audit=只统计不回写(默认)| off=关闭
     response_scan: str = "audit"
-    admin_readonly_token: str = ""      # 可选:只读管理员(仅能看审计/策略,不能改)
     bootstrap_client_name: str = "bootstrap"
     bootstrap_key_file: str = ""
     #: 浏览器 CORS origin 白名单(空 = 不挂 CORS);生产禁止 "*"
@@ -288,7 +308,7 @@ class Settings:
     #: 幂等键缓存(仅非流式;内存 + AEAD 封缄)
     idempotency_ttl_s: int = 600
     idempotency_max: int = 1024
-    #: 指标是否允许匿名拉取(默认仅管理员/只读管理员)
+    #: 指标是否允许匿名拉取(默认仅管理员)
     metrics_public: bool = False
     #: 新建客户端密钥的默认有效期(天;0=永不过期)
     client_key_ttl_days: int = 0
@@ -488,7 +508,6 @@ def load_settings(env_path: Path | None = None) -> Settings:
         max_request_bytes=max_request_bytes,
         stream_buffer_chars=env.get_int("CG_STREAM_BUFFER_CHARS", 128),
         response_scan=response_scan,
-        admin_readonly_token=env.get("CG_ADMIN_READONLY_TOKEN", ""),
         bootstrap_client_name=env.get("CG_BOOTSTRAP_CLIENT_NAME", "bootstrap"),
         bootstrap_key_file=env.get("CG_BOOTSTRAP_KEY_FILE", ""),
         cors_origins=cors_origins,
@@ -524,15 +543,10 @@ def _enforce_production(s: Settings) -> None:
         raise ConfigError("生产环境禁止使用示例 CG_ADMIN_TOKEN")
     if s.allow_anonymous:
         raise ConfigError("生产环境禁止 CG_ALLOW_ANONYMOUS=1(禁止匿名调用上游模型)")
-    if s.admin_readonly_token:
-        if len(s.admin_readonly_token) < 16:
-            raise ConfigError("CG_ADMIN_READONLY_TOKEN 长度必须 ≥16 字符")
-        if hmac_equal(s.admin_readonly_token, s.admin_token):
-            raise ConfigError("CG_ADMIN_READONLY_TOKEN 不能与 CG_ADMIN_TOKEN 相同")
     if "*" in s.cors_origins:
         raise ConfigError("生产环境禁止 CG_CORS_ORIGINS 含通配 '*'")
-    if not s.providers:
-        raise ConfigError("生产环境必须至少配置一个上游提供商(CG_PROVIDERS)")
+    # 「至少一个上游提供商」必须在合并管理面托管配置之后再校验：生产部署可以
+    # 只依赖控制台托管的 Provider，而不在环境变量里写 CG_PROVIDERS。
     for p in s.providers:
         if p.type == "mock":
             logger.warning("生产环境配置了 mock 提供商 %s:仅用于连通性演练", p.name)
@@ -555,8 +569,13 @@ def _enforce_production(s: Settings) -> None:
         logger.warning("CG_PROTECTION_MODE=placeholder:占位符可枚举,建议生产使用 token/encrypt")
 
 
-def hmac_equal(left: str, right: str) -> bool:
-    """常量时间比较（配置校验用；避免把长度差异当信息）。"""
-    import hmac
-    return hmac.compare_digest((left or "").encode("utf-8"),
-                               (right or "").encode("utf-8"))
+def enforce_effective_providers(settings: Settings) -> None:
+    """合并环境变量 + 管理面托管配置后的生产约束校验。
+
+    放在 `build_middleware` 里（而不是 `load_settings`）：否则只有托管 Provider、
+    没有 `CG_PROVIDERS` 的生产部署会在加载托管配置前就被拒绝启动。
+    """
+    if settings.production and not settings.providers:
+        raise ConfigError(
+            "生产环境必须至少配置一个上游提供商：请在 CG_PROVIDERS 或控制台"
+            "「上游配置」中创建 Provider 后重启")

@@ -63,6 +63,37 @@ class Metrics:
             self._hist_sums[key] += value
 
     # ------------------------------------------------------------------ #
+    def snapshot(self) -> dict:
+        """JSON 快照（供控制台看板；只读内存计数器，不触网）。
+
+        直方图返回**未累积**的每桶计数（`counts` 与 `bounds` 等长 +1，最后一项
+        是 +Inf 溢出桶）；前端/看板用 `histogram_quantile` 计算分位数。
+        """
+        with self._lock:
+            counters = [
+                {"name": name, "labels": dict(labels), "value": value}
+                for (name, labels), value in sorted(self._counters.items())
+            ]
+            gauges = [
+                {"name": name, "labels": dict(labels), "value": value}
+                for (name, labels), value in sorted(self._gauges.items())
+            ]
+            histograms = [
+                {"name": name, "labels": dict(labels),
+                 "bounds": list(_DEFAULT_BUCKETS), "counts": list(series),
+                 "count": self._hist_counts[(name, labels)],
+                 "sum": self._hist_sums[(name, labels)]}
+                for (name, labels), series in sorted(self._hist.items())
+            ]
+        return {
+            "uptime_s": max(0.0, time.time() - self._created),
+            "created_epoch": self._created,
+            "counters": counters,
+            "gauges": gauges,
+            "histograms": histograms,
+        }
+
+    # ------------------------------------------------------------------ #
     def render(self) -> str:
         """Prometheus text exposition（稳定排序，便于 diff 与测试）。"""
         with self._lock:
@@ -110,6 +141,45 @@ class Metrics:
         return "\n".join(lines) + "\n"
 
 
+def aggregate_histograms(histograms: list[dict], name: str) -> dict | None:
+    """把同名直方图（不同 labels）合并成一条，供分位数计算。"""
+    selected = [item for item in histograms or [] if item.get("name") == name]
+    if not selected:
+        return None
+    bounds = list(selected[0].get("bounds") or [])
+    counts = [0] * (len(bounds) + 1)
+    total = 0.0
+    for item in selected:
+        item_counts = list(item.get("counts") or [])
+        for index, value in enumerate(item_counts[:len(counts)]):
+            counts[index] += float(value)
+        total += float(item.get("count") or 0)
+    return {"bounds": bounds, "counts": counts, "count": int(total),
+            "sum": sum(float(item.get("sum") or 0) for item in selected)}
+
+
+def histogram_quantile(bounds: list[float], counts: list[float], quantile: float) -> float:
+    """在未累积桶计数上估计分位数（线性插值，单位与 bounds 一致）。
+
+    `+Inf` 桶无法插值，返回最后一个有限边界（保守上界）。
+    """
+    q = min(1.0, max(0.0, float(quantile)))
+    total = sum(max(0.0, float(c)) for c in counts)
+    if total <= 0:
+        return 0.0
+    target = q * total
+    cumulative = 0.0
+    lower = 0.0
+    for index, bound in enumerate(bounds):
+        bucket = max(0.0, float(counts[index] if index < len(counts) else 0))
+        if bucket > 0 and cumulative + bucket >= target:
+            fraction = (target - cumulative) / bucket
+            return lower + fraction * (float(bound) - lower)
+        cumulative += bucket
+        lower = float(bound)
+    return lower
+
+
 def normalize_path(path: str) -> str:
     """把动态路径段折叠成 `{id}`，避免 Prometheus 标签基数爆炸。
 
@@ -121,7 +191,8 @@ def normalize_path(path: str) -> str:
         "/v1/messages/count_tokens",
         "/admin/security/policies", "/admin/clients", "/admin/audit",
         "/admin/audit/verify", "/admin/audit/purge",
-        "/admin/confirmations", "/admin/providers", "/metrics", "/ready",
+        "/admin/confirmations", "/admin/providers",
+        "/admin/provider-defaults", "/admin/dashboard", "/metrics", "/ready",
         "/health",
     }
     if path in known:
