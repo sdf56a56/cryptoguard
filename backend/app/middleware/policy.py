@@ -60,6 +60,10 @@ class EffectivePolicy:
     allowed_models: tuple[str, ...] = ()
     ignored_fields: list[str] = field(default_factory=list)
     adjustments: list[str] = field(default_factory=list)   # 客户端指令造成的收紧/忽略
+    #: 内容面策略摘要与「显式接受但未保护」的计数（进入响应元数据与审计）
+    content_policy: dict = field(default_factory=dict)
+    unprotected_content: dict = field(default_factory=dict)
+    dropped_content: dict = field(default_factory=dict)
 
     def public_view(self) -> dict:
         """对外可见的策略摘要(不含任何明文;供响应元数据与审计)。"""
@@ -77,6 +81,9 @@ class EffectivePolicy:
             "allowed_models": list(self.allowed_models),
             "ignored_fields": list(self.ignored_fields),
             "adjustments": list(self.adjustments),
+            "content_policy": dict(self.content_policy),
+            "unprotected_content": dict(self.unprotected_content),
+            "dropped_content": dict(self.dropped_content),
         }
 
 
@@ -90,6 +97,12 @@ def resolve_policy(settings: Settings, directive: CryptoGuardDirectiveIn | None,
                               categories=tuple(settings.restore_categories)),
         block_on=settings.block_on,
         stable_tokens=settings.stable_tokens,
+        content_policy={
+            "images": settings.image_policy,
+            "documents": settings.document_policy,
+            "anthropic_thinking": settings.anthropic_thinking,
+            "cache_control": settings.cache_control,
+        },
     )
 
     if client is not None:

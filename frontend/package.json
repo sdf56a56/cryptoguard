@@ -1,17 +1,16 @@
 {
   "name": "cryptoguard-frontend",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "echarts": "^5.5.1",
-    "echarts-for-react": "^3.0.2",
-    "framer-motion": "^11.11.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.26.2"

@@ -1,13 +1,13 @@
 """
 装配 —— 把配置 / 信任根 / 存储 / 提供商 / 策略 / 审计拼成一个可挂载的中间件
 
-复用既有信任根:`data/` 目录与 `VAULT_KEY` 与既有平台**同一份**(keys.py 的
-load_or_init),所有子密钥仍由 HKDF 按用途域派生,新增域只有:
+信任根:`data/` 目录与 `VAULT_KEY`(keys.py 的 load_or_init);所有子密钥由
+HKDF 按用途域派生:
   - `client-key/v1`   客户端密钥校验材料的 pepper(见 auth.py)
   - `protection-enc/v*` 保护模式 C 的 AEAD 密钥(版本化,见 protection.py)
   - `audit-mac/v1`    审计记录级 HMAC(见 audit.py)
-新增存储目录只有 `data/security/`(审计)与 `data/clients/`(客户端密钥摘要),
-不改动既有 chain/ sessions/ messages/ 的任何语义。
+存储目录：`data/security/`(审计)、`data/clients/`(客户端密钥摘要)、
+`data/config/`(控制台托管的上游 Provider 配置,整文件加密)。
 
 首次启动(仅开发环境)会自动生成一个 bootstrap 客户端密钥:写文件(若配置了
 CG_BOOTSTRAP_KEY_FILE)或打印到 stderr **一次**,数据库里只留 HMAC 摘要。
@@ -17,19 +17,23 @@ from __future__ import annotations
 
 import logging
 import sys
-from collections.abc import Callable
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..bootstrap import default_data_dir
+from ..paths import default_data_dir
 from ..keys import Vault
 from .audit import AuditStore
 from .auth import AdminAuthenticator, ClientKeyStore
-from .config import Settings, load_settings
+from .config import Settings, enforce_effective_providers, load_settings
 from .confirmations import ConfirmationStore
 from .errors import MiddlewareError
+from .idempotency import IdempotencyStore
+from .metrics import Metrics
 from .pipeline import Pipeline
 from .protection import KeyRing, TokenVault
+from .provider_config import (ManagedProviderStore, compose_settings_with_store,
+                              managed_meta, provider_views)
 from .providers.registry import ProviderRegistry, build_registry
 from .ratelimit import ConcurrencyGuard, SlidingWindowLimiter
 from .recognizers import DetectorConfig
@@ -56,12 +60,43 @@ class MiddlewareApp:
     concurrency: ConcurrencyGuard
     pipeline: Pipeline
     detector: DetectorConfig = field(default_factory=DetectorConfig)
+    metrics: Metrics = field(default_factory=Metrics)
+    idempotency: IdempotencyStore | None = None
     bootstrap_key: str = ""      # 仅在开发环境自动生成时非空(只回显一次)
+    #: 启动时的环境变量配置（托管配置合并前的基底；热生效时用于重新合成）
+    base_settings: Settings | None = None
+    provider_store: ManagedProviderStore | None = None
+    #: 测试注入的 httpx transport；热重建 registry 时沿用
+    transports: dict = field(default_factory=dict)
+    #: 热切换后退役的 registry：在途请求可能仍在用，进程退出时统一关闭
+    retired_registries: list = field(default_factory=list)
+    provider_lock: object = field(default_factory=threading.RLock)
 
     # ------------------------------------------------------------------ #
+    def effective_provider_views(self) -> list[dict]:
+        """有效 Provider 视图（含托管配置来源与运行期密钥状态）。"""
+        if self.provider_store is None:
+            return _provider_views(self.settings, self.registry)
+        base = self.base_settings or self.settings
+        return provider_views(self.settings, self.registry, self.provider_store,
+                              {p.name for p in base.providers})
+
+    def close(self) -> None:
+        """关闭当前与退役的 Provider 连接池（进程退出时调用）。"""
+        seen: set[int] = set()
+        for registry in [self.registry, *self.retired_registries]:
+            if registry is None or id(registry) in seen:
+                continue
+            seen.add(id(registry))
+            try:
+                registry.close()
+            except Exception as exc:  # noqa: BLE001 — 关闭失败不阻断退出
+                logger.warning("关闭 Provider registry 失败: %s", type(exc).__name__)
+        self.retired_registries.clear()
+
     def health(self) -> dict:
         """健康摘要:**不含任何密钥**,不调用上游(避免健康检查放大成本)。"""
-        providers = _provider_views(self.settings, self.registry)
+        providers = self.effective_provider_views()
         try:
             chain = self.audit.verify()
             audit_view = {"records": chain["records"], "chain_intact": chain["intact"],
@@ -75,6 +110,8 @@ class MiddlewareApp:
             "version": __version__,
             "env": self.settings.env,
             "providers": providers,
+            "providers_config": (managed_meta(self.provider_store)
+                                 if self.provider_store is not None else {}),
             "policy": self.settings.public_policy(),
             "auth": {
                 "client_keys": self.clients.count(),
@@ -84,6 +121,25 @@ class MiddlewareApp:
             "audit": audit_view,
             "vault": self.token_vault.stats(),
             "confirmations": self.confirmations.stats(),
+            "idempotency": (self.idempotency.stats()
+                            if self.idempotency is not None else {}),
+            "deployment": {
+                "mode": "single-process",
+                "instance_lock": bool(self.settings.instance_lock),
+                "note": "确认/金库/限流/审计为进程内状态；多 worker/多副本不受支持",
+            },
+            "content_policy": {
+                "images": self.settings.image_policy,
+                "documents": self.settings.document_policy,
+                "anthropic_thinking": self.settings.anthropic_thinking,
+                "cache_control": self.settings.cache_control,
+            },
+            "limits": {
+                "rate_limit_per_min": self.settings.rate_limit_per_min,
+                "max_concurrency": self.settings.max_concurrency,
+                "max_request_bytes": self.settings.max_request_bytes,
+                "sse_heartbeat_s": self.settings.sse_heartbeat_s,
+            },
             "boundary": {
                 "integrity": "摘要/哈希链用于检测改动;不证明模型回答的事实正确性",
                 "provider_identity": "本地网关的证据不代表模型服务商的签名",
@@ -103,8 +159,13 @@ def build_middleware(data_dir: Path | None = None, *, settings: Settings | None 
     data_dir = Path(data_dir or default_data_dir())
     vault = vault or Vault.load_or_init(data_dir)
 
+    base_settings = settings
+    provider_store = ManagedProviderStore(data_dir, vault,
+                                          production=base_settings.production)
+    settings, provider_keys = compose_settings_with_store(base_settings, provider_store)
+    enforce_effective_providers(settings)
     registry = build_registry(settings, transports=transports,
-                              key_resolvers=_llm_config_resolvers(settings, data_dir, vault))
+                              key_overrides=provider_keys)
     keyring = KeyRing.from_vault(vault)
     token_vault = TokenVault(vault, ttl_s=settings.vault_ttl_s,
                              max_requests=settings.vault_max_requests,
@@ -116,7 +177,12 @@ def build_middleware(data_dir: Path | None = None, *, settings: Settings | None 
     clients = ClientKeyStore.build(data_dir, vault)
     admin = AdminAuthenticator(settings.admin_token, production=settings.production)
     detector = DetectorConfig.load(settings.detection_config_path)
-    pipeline = Pipeline(settings, registry, token_vault, audit, keyring, detector)
+    metrics = Metrics()
+    idempotency = IdempotencyStore(
+        vault, ttl_s=settings.idempotency_ttl_s,
+        max_entries=settings.idempotency_max)
+    pipeline = Pipeline(settings, registry, token_vault, audit, keyring, detector,
+                        metrics=metrics)
 
     app = MiddlewareApp(
         settings=settings, vault=vault, registry=registry, keyring=keyring,
@@ -124,48 +190,20 @@ def build_middleware(data_dir: Path | None = None, *, settings: Settings | None 
         clients=clients, admin=admin,
         limiter=SlidingWindowLimiter(),
         concurrency=ConcurrencyGuard(settings.max_concurrency),
-        pipeline=pipeline, detector=detector,
+        pipeline=pipeline, detector=detector, metrics=metrics,
+        idempotency=idempotency,
+        base_settings=base_settings, provider_store=provider_store,
+        transports=dict(transports or {}),
     )
     app.bootstrap_key = _bootstrap_client(app)
-    for warning in _startup_warnings(settings, registry):
+    for warning in _startup_warnings(settings, registry, provider_store,
+                                     base_settings):
         logger.warning("startup: %s", warning)
     return app
 
 
-# --------------------------------------------------------------------------- #
-# 上游密钥来源(复用既有平台)
-# --------------------------------------------------------------------------- #
-def _llm_config_resolvers(settings: Settings, data_dir: Path,
-                          vault: Vault) -> dict[str, Callable[[], str]]:
-    """为声明 key_source=llm-config 的提供商注入密钥解析器。
-
-    复用既有平台的 `LLMConfigStore`(data/llm_config.json,密钥以 AES-GCM 加密落盘,
-    由 VAULT_KEY 经 HKDF 派生的 llm-config/v1 子密钥保护),而不是新建一套密钥存储 ——
-    这样前端「LLM 配置」页改钥后中间件立即生效,且密文与主密钥仍不同处存放。
-
-    每次调用重读:保证改钥即时生效、不在中间件内长期持有另一份密钥副本;
-    代价是一次小文件读取(相对上游推理耗时可忽略)。
-    """
-    names = [p.name for p in settings.providers if p.key_source == "llm-config"]
-    if not names:
-        return {}
-    from ..crypto.aead import AeadCipher
-    from ..llm_config import LLMConfigStore
-
-    store = LLMConfigStore(Path(data_dir), AeadCipher(vault.llm_config_key))
-
-    def resolve() -> str:
-        store.invalidate()          # 丢弃缓存,读到前端最新保存的值
-        return store.load().api_key
-
-    return {name: resolve for name in names}
-
-
 def _provider_views(settings: Settings, registry: ProviderRegistry) -> list[dict]:
-    """静态配置视图 + 运行期实测的「当前是否取得到密钥」。
-
-    两者必须分开:llm-config 来源的密钥在运行期才可知,静态视图只能反映启动期状态。
-    """
+    """静态配置视图 + 运行期实测的「当前是否取得到密钥」。"""
     live = {view["name"]: view for view in registry.health()["providers"]}
     views: list[dict] = []
     for view in settings.provider_public_view():
@@ -215,20 +253,29 @@ def _bootstrap_client(app: MiddlewareApp) -> str:
     return plaintext
 
 
-def _startup_warnings(settings: Settings, registry: ProviderRegistry) -> list[str]:
+def _startup_warnings(settings: Settings, registry: ProviderRegistry,
+                      store: ManagedProviderStore | None = None,
+                      base_settings: Settings | None = None) -> list[str]:
     """启动期安全提示(不影响可用性,但必须说清楚)。"""
     warnings: list[str] = []
     if settings.allow_anonymous:
         warnings.append(
             "CG_ALLOW_ANONYMOUS=1:未认证请求会消耗上游额度,仅限本机调试使用")
-    for view in _provider_views(settings, registry):
+    if store is not None:
+        env_names = {p.name for p in (base_settings or settings).providers}
+        views = provider_views(settings, registry, store, env_names)
+    else:
+        views = _provider_views(settings, registry)
+    for view in views:
         if view["type"] != "mock" and not view["has_key"]:
-            source = (f"环境变量 {view['key_env']}" if view["key_source"] == "env"
-                      else "既有平台 LLM 配置")
+            if view.get("source") == "managed":
+                source = "控制台托管配置未设置 API Key"
+            else:
+                source = f"环境变量 {view.get('key_env') or '<未指定 api_key_env>'}"
             warnings.append(
                 f"提供商 {view['name']} 未配置密钥({source}):"
                 "调用该提供商会 fail-closed 报错")
-    for view in _provider_views(settings, registry):
+    for view in views:
         if view.get("trust_env"):
             warnings.append(
                 f"提供商 {view['name']} 开启了 trust_env:上游请求可能经环境/系统代理,"
@@ -247,4 +294,12 @@ def _startup_warnings(settings: Settings, registry: ProviderRegistry) -> list[st
             "(安全失败,但建议让确认有效期不超过金库 TTL)")
     if settings.detection_config_path:
         warnings.append(f"已加载自定义检测规则: {settings.detection_config_path}")
+    if settings.image_policy == "pass":
+        warnings.append("CG_IMAGE_POLICY=pass:图片内容不经过检测,属于显式接受的未保护面")
+    if settings.document_policy == "pass":
+        warnings.append("CG_DOCUMENT_POLICY=pass:文档内容不经过检测,属于显式接受的未保护面")
+    if settings.metrics_public:
+        warnings.append("CG_METRICS_PUBLIC=1:/metrics 可匿名访问,仅限受信网络")
+    if not settings.instance_lock:
+        warnings.append("CG_INSTANCE_LOCK=0:已关闭单实例锁,确认/金库/限流/审计不再有进程互斥")
     return warnings

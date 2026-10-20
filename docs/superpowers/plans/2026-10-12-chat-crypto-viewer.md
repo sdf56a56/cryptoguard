@@ -1,5 +1,9 @@
 # 对话式前端与密码过程查看器 · 实施计划
 
+> **历史归档（2026-10）**：本文描述的是已删除的演示平台（聊天查看器、密码学
+> 实验室等），不代表当前实现，也不应作为部署依据。当前网关文档见
+> [GATEWAY.md](../../GATEWAY.md)。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 为 CryptoGuard 增加 ChatGPT 式聊天界面（真实 LLM mimo-v2.6-flash）、单页双视角密码过程查看器（隐私/审计），后端 NDJSON 落盘持久化。

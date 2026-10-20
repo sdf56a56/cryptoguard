@@ -790,3 +790,27 @@ def test_verify_endpoint_does_not_trigger_an_upstream_call(client, auth, mw):
                                "response_digest": "0" * 64})
     assert len(provider.seen) == before
     assert json.dumps(_verify(client, auth, {"request_id": rid}).json())
+
+
+def test_record_mac_stays_valid_when_schema_gains_defaulted_fields():
+    """给 RequestRecord 增加带默认值的新字段时，旧记录 MAC 不能因此失效。"""
+    import hashlib
+    import hmac
+
+    from app.canon import canon
+    from app.middleware.verification import RequestRecord, verify_record_mac
+
+    key = b"\x11" * 32
+    record = RequestRecord(request_id="cg-legacy", seq=1, ts="2026-01-01T00:00:00.000000Z",
+                           ts_epoch=1.0, client_id="c1", endpoint="/v1/chat/completions",
+                           outcome="ok")
+    raw = record.to_dict()
+    # 模拟「旧版本落盘时没有这些字段」：只保留一部分键参与 MAC
+    legacy_fields = set(raw) - {"usage", "restored", "actions", "detections"}
+    legacy = {k: v for k, v in raw.items() if k in legacy_fields}
+    legacy_payload = {k: v for k, v in record.to_dict().items()
+                      if k != "record_mac" and k in legacy_fields}
+    legacy["record_mac"] = hmac.new(
+        key, canon(legacy_payload), hashlib.sha256).hexdigest()
+
+    assert verify_record_mac(key, legacy) is True

@@ -462,8 +462,24 @@ def test_anthropic_messages_endpoint(client, auth):
     assert payload["cryptoguard"]["detected"]["by_type"]["EMAIL"] == 1
 
 
-def test_anthropic_rejects_unsupported_thinking(client, auth):
+def test_anthropic_thinking_is_stripped_and_recorded_by_default(client, auth):
+    """Claude Code 默认带 thinking：默认 strip（不 400），但必登记为 ignored。"""
     response = client.post("/v1/messages", headers=auth, json={
+        "model": "mock-chat", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 100},
+    })
+    assert response.status_code == 200, response.text
+    meta = response.json()["cryptoguard"]
+    assert "thinking" in meta["ignored_fields"]
+    assert response.headers["X-CryptoGuard-Content-Policy"].startswith("images=")
+
+
+def test_anthropic_thinking_can_be_rejected_explicitly(make_mw):
+    _, client, key = make_mw(anthropic_thinking="reject",
+                             data_subdir="thinking-reject")
+    response = client.post("/v1/messages", headers={"Authorization": f"Bearer {key}"},
+                           json={
         "model": "mock-chat", "max_tokens": 16,
         "messages": [{"role": "user", "content": "hi"}],
         "thinking": {"type": "enabled", "budget_tokens": 100},

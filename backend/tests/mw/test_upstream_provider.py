@@ -309,41 +309,8 @@ def test_health_view_never_contains_the_key(upstream):
     provider = make_provider(upstream)
     view = provider.health()
     assert view["has_key"] is True
-    assert view["key_source"] == "env"
     assert FAKE_KEY not in json.dumps(view, ensure_ascii=False)
     assert "api_key" not in view
-
-
-def test_dynamic_resolver_is_read_per_call(upstream):
-    """llm-config 来源:解析器每次调用重读,改钥立即生效,且不缓存第二份副本。"""
-    upstream.always(body=completion_body("ok"))
-    state = {"key": ""}
-    provider = make_provider(upstream, api_key="", key_source="llm-config",
-                             api_key_resolver=lambda: state["key"])
-
-    with pytest.raises(MiddlewareError) as excinfo:
-        provider.complete(chat_request())
-    assert excinfo.value.kind == "config"
-    assert provider.health()["has_key"] is False
-    assert upstream.requests == []
-
-    state["key"] = FAKE_KEY          # 相当于运维在前端补上了密钥
-    provider.complete(chat_request())
-    assert upstream.requests[-1]["headers"]["authorization"] == f"Bearer {FAKE_KEY}"
-    assert provider.health()["has_key"] is True
-
-
-def test_resolver_exception_is_treated_as_unconfigured(upstream):
-    """解析器自身出错(文件损坏等)时必须按「未配置」处理,绝不带着半截密钥出网。"""
-    def boom() -> str:
-        raise RuntimeError("llm_config 解密失败")
-
-    provider = make_provider(upstream, api_key="", key_source="llm-config",
-                             api_key_resolver=boom)
-    with pytest.raises(MiddlewareError) as excinfo:
-        provider.complete(chat_request())
-    assert excinfo.value.kind == "config"
-    assert upstream.requests == []
 
 
 # --------------------------------------------------------------------------- #
@@ -791,101 +758,6 @@ def test_registry_allow_unknown_models_passthrough(monkeypatch):
     assert provider.name == "up" and upstream_model == "任意未来模型"
 
 
-def test_llm_config_source_requires_injected_resolver():
-    """声明了 llm-config 却没有解析器:装配期就报错,绝不静默退化成无密钥。"""
-    from app.middleware.config import ProviderSettings
-    settings = _settings(providers=(ProviderSettings(
-        name="up", type="openai-compatible", base_url="https://upstream.invalid",
-        key_source="llm-config", models=("m1",)),))
-
-    with pytest.raises(MiddlewareError) as excinfo:
-        build_registry(settings)
-    assert excinfo.value.kind == "config"
-    assert "llm-config" in excinfo.value.detail
-
-
-def test_llm_config_source_uses_injected_resolver():
-    from app.middleware.config import ProviderSettings
-    settings = _settings(providers=(ProviderSettings(
-        name="up", type="openai-compatible", base_url="https://upstream.invalid",
-        key_source="llm-config", models=("m1",)),))
-
-    registry = build_registry(settings, key_resolvers={"up": lambda: FAKE_KEY})
-    assert registry.get("up").config.resolved_api_key == FAKE_KEY
-
-    registry_without_key = build_registry(settings, key_resolvers={"up": lambda: ""})
-    with pytest.raises(MiddlewareError) as excinfo:
-        registry_without_key.get("up").complete(chat_request())
-    assert excinfo.value.kind == "config"
-    assert "LLM 配置" in excinfo.value.detail
-
-
-def test_llm_config_key_source_reuses_existing_encrypted_store(tmp_path):
-    """key_source=llm-config 必须真的复用既有平台的加密配置存储,而不是另建一套。
-
-    验证三件事:①密钥从既有 store 读得到;②前端改钥后立即生效(无需重启);
-    ③落盘文件里没有明文密钥(仍由 VAULT_KEY 派生的子密钥保护)。
-    """
-    from app.crypto.aead import AeadCipher
-    from app.keys import Vault
-    from app.llm_config import LLMConfigStore
-    from app.middleware.config import ProviderSettings
-    from app.middleware.deps import _llm_config_resolvers
-
-    data_dir = tmp_path / "data"
-    vault = Vault.load_or_init(data_dir)
-    store = LLMConfigStore(data_dir, AeadCipher(vault.llm_config_key))
-    settings = _settings(providers=(ProviderSettings(
-        name="up", type="openai-compatible", base_url="https://upstream.invalid",
-        key_source="llm-config", models=("m1",)),))
-
-    resolve = _llm_config_resolvers(settings, data_dir, vault)["up"]
-    assert resolve() == ""                       # 尚未配置 → 未配置(不是崩)
-
-    store.save(provider="deepseek", base_url="https://api.deepseek.com",
-               model="deepseek-chat", api_key=FAKE_KEY)
-    assert resolve() == FAKE_KEY
-
-    rotated = "sk-rotated-999888777666555444333222111"
-    store.save(provider="deepseek", base_url="https://api.deepseek.com",
-               model="deepseek-chat", api_key=rotated)
-    assert resolve() == rotated                  # 改钥即时生效
-
-    on_disk = (data_dir / "llm_config.json").read_text(encoding="utf-8")
-    assert FAKE_KEY not in on_disk and rotated not in on_disk
-    assert "api_key_enc" in on_disk
-
-    # 未声明 llm-config 的部署不构造任何解析器(不多读文件、不多一份密钥副本)
-    env_settings = _settings()
-    assert _llm_config_resolvers(env_settings, data_dir, vault) == {}
-
-
-def test_provider_key_source_is_validated(tmp_path, monkeypatch):
-    def parse(entries) -> tuple:
-        monkeypatch.setenv("CG_PROVIDERS", json.dumps(entries))
-        return _parse_providers(_Env(tmp_path / "nonexistent.env"),
-                                (10.0, 120.0, 2, False))
-
-    parsed = parse([{
-        "name": "up", "type": "openai-compatible", "base_url": "https://x.invalid",
-        "key_source": "llm-config", "models": ["m1"]}])
-    assert parsed[0].key_source == "llm-config"
-    # llm-config 来源不得从环境变量取值(避免两条来源互相污染)
-    assert parsed[0].api_key() == ""
-
-    assert parse([{"name": "up", "type": "openai-compatible",
-                   "base_url": "https://x.invalid", "models": ["m1"]}])[0].key_source == "env"
-
-    with pytest.raises(ConfigError):
-        parse([{"name": "up", "type": "openai-compatible", "base_url": "https://x.invalid",
-                "key_source": "vault", "models": ["m1"]}])
-    with pytest.raises(ConfigError):
-        parse([{"name": "up", "type": "mock", "key_source": "llm-config"}])
-    with pytest.raises(ConfigError):
-        parse([{"name": "up", "type": "openai-compatible", "base_url": "https://x.invalid",
-                "token_limit_field": "max_output_tokens", "models": ["m1"]}])
-
-
 def test_trust_env_defaults_to_off_and_is_configurable(tmp_path, monkeypatch):
     """出网是否走代理是安全相关的显式决策:默认关闭,可在全局或单个提供商上开启。"""
     def parse(entries, defaults):
@@ -922,7 +794,7 @@ def test_registry_forwards_trust_env(tmp_path, monkeypatch):
                          "真实厂商联调请显式设置 CG_REAL_UPSTREAM_KEY / "
                          "CG_REAL_UPSTREAM_URL / CG_REAL_MODEL 后运行 "
                          "tests/mw/test_real_http_e2e.py::test_real_vendor_upstream_opt_in,"
-                         "边界与注意事项见 docs/MIDDLEWARE_TESTS.md")
+                         "边界与注意事项见 docs/GATEWAY_TESTS.md")
 def test_real_upstream_not_executed():
     """占位:真实厂商(DeepSeek/OpenAI)连通性测试。
 

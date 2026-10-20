@@ -15,7 +15,6 @@ Provider Adapter 抽象 —— 与厂商协议解耦的中立请求/响应模型
 from __future__ import annotations
 
 import abc
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -26,11 +25,9 @@ from ..errors import MiddlewareError
 class ProviderConfig:
     """一个已装配好的提供商(密钥已解析到内存)。
 
-    密钥来源二选一,显式声明、不猜测:
-      - `env`:启动期从 `api_key_env` 指向的环境变量读取,存入 `api_key`;
-      - `llm-config`:每次调用时经 `api_key_resolver` 读取(复用既有平台的前端
-        「LLM 配置」加密存储,支持运行时改钥而不重启)。
-    两者都只存在于内存,绝不序列化/日志/回显。
+    密钥来自 `api_key_env` 指向的环境变量，或控制台托管配置（见
+    middleware/provider_config.py）；只在内存中解密，绝不序列化/日志/回显。
+    环境变量密钥改后需重启；控制台托管配置保存后热生效。
     """
 
     name: str
@@ -39,10 +36,8 @@ class ProviderConfig:
     api_key: str = ""              # 仅内存;绝不序列化/日志
     #: 密钥来自哪个环境变量(仅变量名,不是密钥本身;供排错与 health 展示)
     api_key_env: str = ""
-    #: "env" | "llm-config"
+    #: 密钥来源:managed(控制台托管、加密落盘) | env(环境变量/.env) | none
     key_source: str = "env"
-    #: 动态密钥解析器(仅 key_source=llm-config 时非 None)
-    api_key_resolver: Callable[[], str] | None = None
     models: tuple[str, ...] = ()
     display_name: str = ""
     timeout_connect: float = 10.0
@@ -60,13 +55,8 @@ class ProviderConfig:
 
     @property
     def resolved_api_key(self) -> str:
-        """当前生效的上游密钥(动态来源每次调用重读,保证改钥即时生效)。"""
-        if self.api_key_resolver is None:
-            return self.api_key
-        try:
-            return (self.api_key_resolver() or "").strip()
-        except Exception:  # noqa: BLE001 — 解析失败视为「未配置」,绝不因此出网
-            return ""
+        """当前生效的上游密钥（启动期从环境变量读入，只存在于内存）。"""
+        return (self.api_key or "").strip()
 
     @property
     def configured(self) -> bool:
@@ -175,8 +165,8 @@ class ModelProvider(abc.ABC):
         if not self.config.base_url:
             missing.append("base_url")
         if not self.config.resolved_api_key:
-            if self.config.key_source == "llm-config":
-                missing.append("密钥(来源:既有平台 LLM 配置,请在管理界面或数据目录中配置)")
+            if self.config.key_source == "managed":
+                missing.append("密钥(控制台托管配置缺少 API Key)")
             else:
                 missing.append(
                     f"密钥(环境变量 {self.config.api_key_env or '<未指定 api_key_env>'})")

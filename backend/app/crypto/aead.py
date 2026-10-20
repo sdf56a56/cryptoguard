@@ -7,7 +7,7 @@ AEAD 模块 —— AES-GCM 对称认证加密
   - 主密钥不出本地：映射表（占位符 -> 明文）只以密文形态落盘/传输。
 
 明确不承诺：
-  - 不承诺抵抗侧信道攻击（本实现为演示级软件实现）。
+  - 不承诺抵抗侧信道攻击（本实现为软件实现，未做常数时间加固）。
   - 不承诺防持有主密钥的本地进程被攻破。
 
 归约：安全性依赖 AES 的分组密码安全性与 GCM 的认证安全，标准 NIST 认可算法。
@@ -25,7 +25,7 @@ class AeadCipher:
     """AES-GCM 封装：加解密任意 JSON 可序列化对象，输出 base64 字符串。"""
 
     def __init__(self, key: bytes | None = None):
-        # 主密钥：256-bit。真实部署应来自 KMS / 硬件密钥，本演示在本地随机生成。
+        # 主密钥：256-bit，由 VAULT_KEY 经 HKDF 派生（生产路径），或测试显式注入。
         #
         # 注意这里的 None 与 b"" 语义不同：只有**显式不传**（None，演示/临时会话密钥）
         # 才随机生成；传入空字节串说明调用方以为自己在用一把真实密钥，此时必须立刻
@@ -33,11 +33,6 @@ class AeadCipher:
         # 没有任何错误信号（fail-closed）。
         self._key = os.urandom(32) if key is None else key
         self._aead = AESGCM(self._key)
-
-    @property
-    def key_b64(self) -> str:
-        """仅用于演示展示，真实系统绝不外发。"""
-        return base64.b64encode(self._key).decode()
 
     def encrypt(self, data: dict | list | str) -> dict:
         """加密任意对象，返回 {iv, tag, ciphertext}（base64）。"""

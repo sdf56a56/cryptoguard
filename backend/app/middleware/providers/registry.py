@@ -3,8 +3,9 @@
 
 安全目标:
   - 网关主逻辑不硬编码任何厂商 URL/密钥/字段;全部经 ProviderConfig 注入;
-  - 模型白名单:默认只允许路由到 CG_PROVIDERS 中显式声明的 model;
-    未声明模型一律 404 并列出可用模型(绝不静默转发到未知上游消耗费用);
+  - 模型白名单:默认只允许路由到 CG_PROVIDERS 或控制台托管 Provider 中显式
+    声明的 model;未声明模型一律 404 并列出可用模型(绝不静默转发到未知上游
+    消耗费用);
   - `provider/model` 前缀语法允许显式指定提供商,但不绕过白名单。
 
 明确不承诺:不承诺上游是否真的提供该模型(由 /v1/models 的定义与上游自身为准)。
@@ -12,7 +13,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 
 import httpx
 
@@ -148,31 +148,31 @@ class ProviderRegistry:
 
 def build_registry(settings, *, transports: dict[str, httpx.BaseTransport] | None = None,
                    extra_providers: dict[str, ModelProvider] | None = None,
-                   key_resolvers: dict[str, "Callable[[], str]"] | None = None) -> ProviderRegistry:
+                   key_overrides: dict[str, str] | None = None) -> ProviderRegistry:
     """按 Settings 装配注册表。
 
-    - key_source=env:启动期经 ProviderSettings.api_key() 从环境变量读取;
-    - key_source=llm-config:经 key_resolvers 注入的解析器每次调用重读(复用既有
-      平台的加密 LLM 配置);
-    - 两种来源在密钥缺失时都**不阻断装配**(便于先起服务再补密钥),
-      但调用时由 ModelProvider.ensure_configured() fail-closed 报 config 错误,绝不出网;
-    - transports 仅供测试注入 httpx.MockTransport,生产路径不传。
+    - 密钥在启动期解析后只存在于内存：`key_overrides`（控制台托管、已解密）优先，
+      其次 ProviderSettings.api_key()（环境变量 / backend/.env）；
+    - 密钥缺失**不阻断装配**（便于先起服务再补密钥），但调用时由
+      ModelProvider.ensure_configured() fail-closed 报 config 错误，绝不出网；
+    - transports 仅供测试注入 httpx.MockTransport，生产路径不传。
     """
     transports = transports or {}
-    resolvers = key_resolvers or {}
+    key_overrides = key_overrides or {}
     providers: dict[str, ModelProvider] = {}
     for p in settings.providers:
         impl = _PROVIDER_TYPES.get(p.type)
         if impl is None:
             raise MiddlewareError("config", f"提供商 {p.name!r} 的 type={p.type!r} 无实现")
+        managed = p.name in key_overrides
         config = ProviderConfig(
             name=p.name,
             type=p.type,
             base_url=p.base_url,
-            api_key=p.api_key() if p.key_source == "env" else "",
+            api_key=(key_overrides.get(p.name) or "") if managed else p.api_key(),
             api_key_env=p.api_key_env,
-            key_source=p.key_source,
-            api_key_resolver=resolvers.get(p.name),
+            key_source=("managed" if managed else
+                        ("env" if (p.type != "mock" and p.api_key_env) else "none")),
             models=tuple(p.models),
             display_name=p.display_name or p.name,
             timeout_connect=p.timeout_connect,
@@ -183,17 +183,11 @@ def build_registry(settings, *, transports: dict[str, httpx.BaseTransport] | Non
             stream_options=p.stream_options,
             token_limit_field=p.token_limit_field,
         )
-        if p.key_source == "llm-config" and p.name not in resolvers:
-            raise MiddlewareError(
-                "config",
-                f"提供商 {p.name!r} 声明 key_source=llm-config,但装配期未注入密钥解析器")
         kwargs = {"transport": transports[p.name]} if p.name in transports else {}
         providers[p.name] = impl(config, **kwargs)
         if not config.configured:
-            logger.warning("提供商 %s 未配置完整(%s):调用该提供商会 fail-closed 报错",
-                           p.name,
-                           f"环境变量 {p.api_key_env} 为空" if p.key_source == "env"
-                           else "既有平台 LLM 配置中尚无密钥")
+            logger.warning("提供商 %s 未配置完整(环境变量 %s 为空):"
+                           "调用该提供商会 fail-closed 报错", p.name, p.api_key_env)
     for name, provider in (extra_providers or {}).items():
         providers[name] = provider
     return ProviderRegistry(

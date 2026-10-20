@@ -130,12 +130,13 @@ class Pipeline:
 
     def __init__(self, settings: Settings, registry: ProviderRegistry,
                  vault: TokenVault, audit: AuditStore, keyring,
-                 detector: DetectorConfig | None = None) -> None:
+                 detector: DetectorConfig | None = None, metrics=None) -> None:
         self.settings = settings
         self.registry = registry
         self.vault = vault
         self.audit = audit
         self.keyring = keyring
+        self.metrics = metrics
         self.detector = detector or DetectorConfig.load(settings.detection_config_path)
         self.response_scan = getattr(settings, "response_scan", "audit")
         if self.response_scan not in RESPONSE_SCAN_MODES:
@@ -231,6 +232,13 @@ class Pipeline:
 
         detections = _detection_summary(collector.findings)
         actions = _action_summary(collector)
+        if policy.content_policy:
+            actions["content_policy"] = dict(policy.content_policy)
+        if policy.unprotected_content:
+            actions["unprotected_content"] = dict(policy.unprotected_content)
+        if policy.dropped_content:
+            actions["dropped_content"] = dict(policy.dropped_content)
+        self._count_detections(collector.findings, collector.blocked)
         if policy.release_requested_spans:
             # 如实登记:客户端请求过放行,但**没有**放行(见 policy.py / confirmations.py)
             actions["release_requested"] = len(policy.release_requested_spans)
@@ -270,17 +278,20 @@ class Pipeline:
         try:
             completion = prepared.provider.complete(prepared.request)
         except MiddlewareError as exc:
+            self._count_upstream(prepared, "error", exc.kind)
             self._record(prepared, outcome="error", error_kind=exc.kind,
                          upstream_status=exc.upstream_status,
                          latency_ms=_ms(started))
             raise
         except Exception as exc:  # noqa: BLE001 — 未知异常也留审计,不泄露栈
             mapped = MiddlewareError("internal", f"上游调用异常: {type(exc).__name__}")
+            self._count_upstream(prepared, "error", mapped.kind)
             self._record(prepared, outcome="error", error_kind=mapped.kind,
                          latency_ms=_ms(started))
             raise mapped from None
 
         latency = _ms(started)
+        self._count_upstream(prepared, "ok")
         delivered, restore_view_, scan = self._finalize(prepared, completion)
         # 摘要绑定的是**交付给客户端**的响应:文本用还原后的、model 用响应体里那个
         # (= 请求的 model,见 routes 的 _openai_response)。不能用 delivered.model ——
@@ -295,6 +306,7 @@ class Pipeline:
             usage=delivered.usage or {},
         )
         meta = self._meta(prepared, restore_view_, scan, digest, record)
+        self._count_restore(restore_view_)
         if prepared.policy.destroy_mapping:
             self.vault.drop(prepared.ctx.request_id)
         return delivered, meta
@@ -386,6 +398,8 @@ class Pipeline:
     def finish_stream(self, prepared: PreparedRequest, state: StreamState) -> dict:
         """流结束后:算摘要、写审计、返回响应元数据(失败也留审计)。"""
         outcome = "error" if state.error else ("ok" if state.complete else "incomplete")
+        self._count_upstream(prepared, outcome,
+                             state.error.kind if state.error else "")
         calls = [{"name": c.get("name") or "", "arguments": c.get("arguments") or ""}
                  for _, c in sorted(state.tool_calls.items())]
         digest = response_digest(text=state.joined_text(), tool_calls=calls,
@@ -397,6 +411,7 @@ class Pipeline:
             error_kind=state.error.kind if state.error else "",
             restore=state.restore, response_scan=state.response_scan,
             usage=state.usage or {})
+        self._count_restore(state.restore)
         meta = self._meta(prepared, state.restore, state.response_scan, digest, record)
         meta["stream"] = {"complete": state.complete,
                           "note": ("上游流未正常结束,已按不完整收尾(不重试,"
@@ -405,6 +420,45 @@ class Pipeline:
         if prepared.policy.destroy_mapping:
             self.vault.drop(prepared.ctx.request_id)
         return meta
+
+    # ------------------------------------------------------------------ #
+    # 指标（只计数，不含明文；失败绝不影响请求路径）
+    # ------------------------------------------------------------------ #
+    def _count_detections(self, findings, blocked) -> None:
+        if self.metrics is None:
+            return
+        try:
+            for finding in findings:
+                if finding.suppressed:
+                    continue
+                self.metrics.inc("detections_total", {"type": finding.type})
+            for finding in blocked:
+                self.metrics.inc("blocked_total", {"type": finding.type})
+        except Exception:  # noqa: BLE001 — 指标失败不能影响请求
+            logger.debug("metrics_detections_failed", exc_info=True)
+
+    def _count_upstream(self, prepared: PreparedRequest, outcome: str,
+                        error_kind: str = "") -> None:
+        if self.metrics is None:
+            return
+        try:
+            self.metrics.inc("upstream_requests_total", {
+                "provider": str(getattr(prepared.provider, "name", "")),
+                "outcome": outcome or "error",
+                "error_kind": error_kind or "none",
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("metrics_upstream_failed", exc_info=True)
+
+    def _count_restore(self, restore: dict) -> None:
+        if self.metrics is None or not isinstance(restore, dict):
+            return
+        try:
+            for item in restore.get("restored") or []:
+                self.metrics.inc("tokens_restored_total",
+                                 {"type": str(item.get("type") or "UNKNOWN")})
+        except Exception:  # noqa: BLE001
+            logger.debug("metrics_restore_failed", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # 检测与保护
@@ -656,6 +710,9 @@ class Pipeline:
             "restore": restore,
             "response_scan": scan,
             "ignored_fields": list(prepared.policy.ignored_fields),
+            "content_policy": dict(prepared.policy.content_policy),
+            "unprotected_content": dict(prepared.policy.unprotected_content),
+            "dropped_content": dict(prepared.policy.dropped_content),
             "digest": {
                 "request": prepared.request_digest,
                 "response": digest,
